@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 import subprocess
 import os
+from streamlit_autorefresh import st_autorefresh
 
 # --- AUTOMATIC BACKGROUND PIPELINE LAUNCHER ---
 @st.cache_resource
@@ -13,6 +14,9 @@ def start_pipeline():
         subprocess.Popen(["python", "pipeline.py"])
 
 start_pipeline()
+
+# --- AUTO-REFRESH UI EVERY 3 SECONDS ---
+st_autorefresh(interval=3000, key="datarefresh")
 
 # --- CONFIGURATION & PAGE SETUP ---
 st.set_page_config(
