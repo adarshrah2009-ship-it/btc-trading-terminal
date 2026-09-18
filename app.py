@@ -15,7 +15,7 @@ def start_pipeline_background():
 
 start_pipeline_background()
 
-# Safe auto-refresh import
+# --- AUTO-REFRESH UI EVERY 3 SECONDS ---
 try:
     from streamlit_autorefresh import st_autorefresh
     st_autorefresh(interval=3000, key="datarefresh")
@@ -38,7 +38,7 @@ if "trade_history" not in st.session_state:
 # --- SIDEBAR TERMINAL CONFIG ---
 st.sidebar.title("⚙️ Terminal Config")
 enable_paper_trader = st.sidebar.toggle("Enable AI Paper Trader", value=True)
-min_confidence = st.sidebar.slider("Min AI Confidence Threshold", 0.50, 0.95, 0.65, 0.05)
+min_confidence = st.sidebar.slider("Min AI Confidence Threshold", 0.50, 0.95, 0.55, 0.05)
 
 position_size = st.sidebar.number_input("Position Size ($)", value=2000.0, step=100.0)
 take_profit = st.sidebar.number_input("Take Profit ($)", value=50.0, step=5.0)
@@ -71,24 +71,24 @@ if df.empty:
     st.warning("⏳ Connecting to exchange WebSocket stream & initializing SQLite entries...")
 else:
     latest = df.iloc[-1]
-    current_price = latest.get('mid_price', 0.0)
-    current_ofi = latest.get('ofi', 0.0)
+    current_price = float(latest.get('mid_price', 0.0))
+    current_ofi = float(latest.get('ofi', 0.0))
     
-    # 1. Top Bar Metrics
+    # 1. TOP METRICS BAR
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Micro-Price", f"${latest.get('micro_price', 0.0):,.2f}")
     col2.metric("Order Flow Imbalance (OFI)", f"{current_ofi:,.2f}")
     col3.metric("Absorption Ratio", f"{latest.get('absorption_ratio', 0.0):.4f}")
     col4.metric("CVD Acceleration", f"{latest.get('cvd_acceleration', 0.0):.2f}")
 
-    # 2. Main Microstructure Chart
+    # 2. MICROSTRUCTURE DYNAMICS CHART
     st.subheader("📈 Microstructure Dynamics")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], name="Mid Price", line=dict(color="#00FFA3", width=1.5)))
     if 'micro_price' in df.columns:
         fig.add_trace(go.Scatter(x=df['timestamp'], y=df['micro_price'], name="Micro-Price", line=dict(color="#FF007A", width=1.5, dash='dash')))
     
-    fig.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
+    fig.update_layout(template="plotly_dark", height=380, margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
     # 3. AI PAPER TRADING EXECUTION ENGINE
@@ -96,62 +96,62 @@ else:
     st.subheader("🤖 Live AI Paper Trader Engine")
 
     if enable_paper_trader:
-        # Check current active position management (Take-Profit / Stop-Loss)
+        # Evaluate active position management (Take Profit / Stop Loss)
         if st.session_state.positions:
             for pos in list(st.session_state.positions):
                 entry_price = pos["entry_price"]
                 side = pos["side"]
                 pnl = (current_price - entry_price) if side == "LONG" else (entry_price - current_price)
                 
-                # Check exit conditions
+                # Check exit rules
                 if pnl >= take_profit or pnl <= -stop_loss:
                     exit_reason = "TAKE PROFIT 🎯" if pnl >= take_profit else "STOP LOSS 🛑"
                     st.session_state.trade_history.append({
-                        "timestamp": pd.Timestamp.now().strftime("%H:%M:%S"),
-                        "side": side,
-                        "entry": entry_price,
-                        "exit": current_price,
-                        "pnl": pnl,
-                        "status": exit_reason
+                        "Time": pd.Timestamp.now().strftime("%H:%M:%S"),
+                        "Side": side,
+                        "Entry Price": f"${entry_price:,.2f}",
+                        "Exit Price": f"${current_price:,.2f}",
+                        "PnL ($)": f"${pnl:,.2f}",
+                        "Status": exit_reason
                     })
                     st.session_state.positions.remove(pos)
 
-        # Trigger new signals if no open position exists
+        # Signal Generation Logic
         if not st.session_state.positions:
-            # Normalized signal trigger simulation based on threshold
-            raw_confidence = min(abs(current_ofi) / 10.0 + 0.50, 0.99)
+            # Model confidence score computed from microstructure dynamics
+            calc_confidence = min(abs(current_ofi) / 5.0 + 0.50, 0.99)
             
-            if raw_confidence >= min_confidence and abs(current_ofi) > 0.1:
+            if calc_confidence >= min_confidence and abs(current_ofi) > 0.05:
                 signal_side = "LONG" if current_ofi > 0 else "SHORT"
                 st.session_state.positions.append({
                     "entry_price": current_price,
                     "side": signal_side,
                     "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                st.success(f"🚀 **New AI Signal Executed:** Opened **{signal_side}** position @ **${current_price:,.2f}** (Confidence: {raw_confidence:.2f})")
+                st.success(f"🚀 **New AI Trade Executed:** Opened **{signal_side}** position @ **${current_price:,.2f}** | Confidence: **{calc_confidence:.2f}**")
             else:
-                st.info(f"🔍 AI Scanning Feed... Signal Confidence ({raw_confidence:.2f}) below threshold ({min_confidence:.2f}).")
+                st.info(f"🔍 **AI Scanner Active:** Current signal confidence (**{calc_confidence:.2f}**) below set threshold (**{min_confidence:.2f}**). Searching for high-probability setups...")
 
-        # Display Open Position Dashboard
+        # Display Open Active Position Dashboard
         if st.session_state.positions:
             active_pos = st.session_state.positions[0]
             entry_p = active_pos["entry_price"]
             s = active_pos["side"]
             live_pnl = (current_price - entry_p) if s == "LONG" else (entry_p - current_price)
             
-            pos_col1, pos_col2, pos_col3, pos_col4 = st.columns(4)
-            pos_col1.metric("Active Position", f"{s}")
-            pos_col2.metric("Entry Price", f"${entry_p:,.2f}")
-            pos_col3.metric("Current Price", f"${current_price:,.2f}")
-            pos_col4.metric("Unrealized PnL", f"${live_pnl:,.2f}", delta=f"${live_pnl:,.2f}")
+            p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+            p_col1.metric("Active Order", f"{s}")
+            p_col2.metric("Entry Price", f"${entry_p:,.2f}")
+            p_col3.metric("Current Price", f"${current_price:,.2f}")
+            p_col4.metric("Unrealized PnL", f"${live_pnl:,.2f}", delta=f"${live_pnl:,.2f}")
     else:
-        st.write("Paper Trader is disabled. Enable it in the sidebar to run simulations.")
+        st.write("Paper Trader is currently disabled in sidebar settings.")
 
-    # 4. Closed Trade History Table
+    # 4. CLOSED TRADE HISTORY LOGS
     if st.session_state.trade_history:
-        st.subheader("📜 Closed Trade History")
+        st.subheader("📜 Executed Trade Logs")
         st.dataframe(pd.DataFrame(st.session_state.trade_history), use_container_width=True)
 
-    # 5. Raw Data Stream Viewer
-    with st.expander("📊 View Live Microstructure Database Feed"):
+    # 5. RAW DATASTREAM FEED
+    with st.expander("📊 View Live Microstructure Stream Feed"):
         st.dataframe(df.tail(20), use_container_width=True)
