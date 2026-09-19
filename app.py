@@ -77,7 +77,6 @@ def load_trade_history():
 # --- 5. LIGHTGBM INFERENCE ENGINE ---
 @st.cache_resource
 def load_or_init_lgbm():
-    """Initializes an online LightGBM binary classifier for directional inference."""
     X_dummy = np.random.randn(100, 6)
     y_dummy = np.random.randint(0, 2, size=100)
     train_data = lgb.Dataset(X_dummy, label=y_dummy)
@@ -88,7 +87,6 @@ def load_or_init_lgbm():
 lgb_model = load_or_init_lgbm()
 
 def predict_signal_probability(features):
-    """Predicts long probability from feature vector [MicroSpread, OFI, Absorption, CVD_Accel, EMADiff, ATR]."""
     features_array = np.array(features).reshape(1, -1)
     prob_long = lgb_model.predict(features_array)[0]
     return prob_long
@@ -122,7 +120,7 @@ def load_and_process_data():
         df['ema_100'] = df['mid_price'].ewm(span=100, adjust=False).mean()
         df['cvd_slope'] = df['cvd_acceleration'].rolling(window=10, min_periods=1).mean()
         
-        # Calculate ATR (Average True Range)
+        # Calculate ATR
         df['high_low'] = df['mid_price'] - df['mid_price'].shift(1)
         df['atr'] = df['high_low'].abs().rolling(window=14, min_periods=1).mean().fillna(10.0)
         
@@ -167,9 +165,14 @@ else:
     # 2. MICROSTRUCTURE & TREND CHART
     st.subheader("📈 Microstructure & Trend Regime Chart")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], name="Mid Price", line=dict(color="#00FFA3", width=1.5)))
+    
+    # Mid Price line (Solid Green)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], name="Mid Price", line=dict(color="#00FFA3", width=2.5)))
+    # Micro-Price line (Dashed Pink)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['micro_price'], name="Micro-Price", line=dict(color="#FF007A", width=1.5, dash='dash')))
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema_100'], name="100 EMA Trend", line=dict(color="#00E5FF", width=1.2)))
+    # 100 EMA Trend line (Dotted Blue)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema_100'], name="100 EMA Trend", line=dict(color="#00E5FF", width=1.5, dash='dot')))
+    
     fig.update_layout(template="plotly_dark", height=380, margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
@@ -178,7 +181,6 @@ else:
     st.subheader("🤖 Live ML Paper Trader Engine")
 
     if enable_paper_trader:
-        # Manage active open positions
         if st.session_state.positions:
             for pos in list(st.session_state.positions):
                 entry_price = pos["entry_price"]
@@ -189,7 +191,6 @@ else:
                 
                 pnl = (current_price - entry_price) if side == "LONG" else (entry_price - current_price)
                 
-                # Check ATR dynamic triggers
                 if pnl >= tp_val or pnl <= -sl_val:
                     exit_reason = "DYNAMIC TP 🎯" if pnl >= tp_val else "DYNAMIC SL 🛑"
                     time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -197,7 +198,6 @@ else:
                     log_trade_to_db(time_str, side, entry_price, current_price, pnl, exit_reason, conf)
                     st.session_state.positions.remove(pos)
 
-        # Signal Trigger & Regime Filter Validation
         if not st.session_state.positions:
             is_bullish_regime = (current_price > current_ema) and (current_cvd_slope >= 0)
             is_bearish_regime = (current_price < current_ema) and (current_cvd_slope <= 0)
@@ -205,7 +205,6 @@ else:
             calculated_sl = current_atr * atr_sl_mult
             calculated_tp = current_atr * atr_tp_mult
             
-            # LONG Signal Rule
             if is_bullish_regime and ml_prob_long >= min_confidence and current_ofi > 0.05:
                 st.session_state.positions.append({
                     "entry_price": current_price,
@@ -217,7 +216,6 @@ else:
                 })
                 st.success("🚀 ML Executed LONG @ $" + f"{current_price:,.2f}" + " | Prob: " + f"{ml_prob_long:.2%}" + " | Dynamic SL: $" + f"{calculated_sl:.2f}" + " | TP: $" + f"{calculated_tp:.2f}")
             
-            # SHORT Signal Rule
             elif is_bearish_regime and ml_prob_short >= min_confidence and current_ofi < -0.05:
                 st.session_state.positions.append({
                     "entry_price": current_price,
@@ -232,7 +230,6 @@ else:
             else:
                 st.info("🔍 ML Scanner Active: Scanning for setups...")
 
-        # Display active open trade status
         if st.session_state.positions:
             active = st.session_state.positions[0]
             entry_p = active["entry_price"]
@@ -251,7 +248,3 @@ else:
     if not trades_df.empty:
         st.subheader("📜 Over-Night Executed Trade Logs")
         st.dataframe(trades_df, use_container_width=True)
-
-    # 5. RAW DATASTREAM FEED
-    with st.expander("📊 View Live Microstructure & Feature Vector Stream"):
-        st.dataframe(df.tail(20), use_container_width=True)
