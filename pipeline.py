@@ -156,3 +156,5 @@ async def stream_l2_microstructure():
 
 if __name__ == "__main__":
     asyncio.run(stream_l2_microstructure())
+
+
