@@ -215,13 +215,7 @@ else:
                     "confidence": ml_prob_long,
                     "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                msg_long = (
-                    f"🚀 **ML Executed LONG** @ **${current_price:,.2f}** | "
-                    f"Prob: **{ml_prob_long:.2%}** | "
-                    f"Dynamic SL: **${calculated_sl:.2f}** | "
-                    f"TP: **${calculated_tp:.2f}**"
-                )
-                st.success(msg_long)
+                st.success("🚀 ML Executed LONG @ $" + f"{current_price:,.2f}" + " | Prob: " + f"{ml_prob_long:.2%}" + " | Dynamic SL: $" + f"{calculated_sl:.2f}" + " | TP: $" + f"{calculated_tp:.2f}")
             
             # SHORT Signal Rule
             elif is_bearish_regime and ml_prob_short >= min_confidence and current_ofi < -0.05:
@@ -233,16 +227,10 @@ else:
                     "confidence": ml_prob_short,
                     "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                msg_short = (
-                    f"🔻 **ML Executed SHORT** @ **${current_price:,.2f}** | "
-                    f"Prob: **{ml_prob_short:.2%}** | "
-                    f"Dynamic SL: **${calculated_sl:.2f}** | "
-                    f"TP: **${calculated_tp:.2f}**"
-                )
-                st.success(msg_short)
+                st.success("🔻 ML Executed SHORT @ $" + f"{current_price:,.2f}" + " | Prob: " + f"{ml_prob_short:.2%}" + " | Dynamic SL: $" + f"{calculated_sl:.2f}" + " | TP: $" + f"{calculated_tp:.2f}")
             
             else:
-                st.info(f"🔍 **ML Scanner Active:** Scanning for setups... (Current Regimes — Bullish: `{is_bullish_regime}`, Bearish: `{is_bearish_regime}` | Max Model Confidence: `{max(ml_prob_long, ml_prob_short):.2%}`)")
+                st.info("🔍 ML Scanner Active: Scanning for setups...")
 
         # Display active open trade status
         if st.session_state.positions:
