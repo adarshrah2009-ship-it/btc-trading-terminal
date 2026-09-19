@@ -2,8 +2,7 @@ streamlit
 streamlit-autorefresh
 pandas
 numpy
-xgboost
-joblib
 plotly
 requests
 websockets
+lightgbm
