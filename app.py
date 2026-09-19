@@ -19,7 +19,7 @@ start_pipeline_background()
 
 # --- 2. PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="BTC ML & Microstructure Terminal",
+    page_title="BTC Quant Microstructure & ML Terminal",
     page_icon="⚡",
     layout="wide"
 )
@@ -37,7 +37,9 @@ def init_trade_db():
             side TEXT,
             entry_price REAL,
             exit_price REAL,
-            pnl REAL,
+            gross_pnl REAL,
+            net_pnl REAL,
+            fee_slippage REAL,
             status TEXT,
             ml_confidence REAL
         )
@@ -47,13 +49,14 @@ def init_trade_db():
 
 init_trade_db()
 
-def log_trade_to_db(timestamp, side, entry_price, exit_price, pnl, status, confidence):
+def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO paper_trades (timestamp, side, entry_price, exit_price, pnl, status, ml_confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (timestamp, side, entry_price, exit_price, pnl, status, confidence))
+        INSERT INTO paper_trades 
+        (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence))
     conn.commit()
     conn.close()
 
@@ -89,14 +92,19 @@ def predict_signal_probability(features):
 if "positions" not in st.session_state:
     st.session_state.positions = []
 
-st.sidebar.title("⚙️ Terminal Config")
+st.sidebar.title("⚙️ Institutional Config")
 enable_paper_trader = st.sidebar.toggle("Enable ML Paper Trader", value=True)
 min_confidence = st.sidebar.slider("Min ML Probability Threshold", 0.50, 0.95, 0.65, 0.05)
+z_threshold = st.sidebar.slider("Min OFI Z-Score Threshold (σ)", 1.0, 3.0, 1.5, 0.1)
+
+st.sidebar.subheader("Execution Friction Model")
+taker_fee_rate = st.sidebar.number_input("Taker Fee Rate (%)", value=0.05, step=0.01) / 100.0
+slippage_atr_pct = st.sidebar.number_input("Slippage (% of ATR)", value=10.0, step=1.0) / 100.0
 
 atr_sl_mult = st.sidebar.number_input("ATR Stop-Loss Multiplier", value=1.5, step=0.1)
 atr_tp_mult = st.sidebar.number_input("ATR Take-Profit Multiplier", value=3.0, step=0.1)
 
-# --- 6. DATA PROCESSING & FEATURE ENGINEERING ---
+# --- 6. DATA PROCESSING & ROLLING Z-SCORE NORMALIZATION ---
 def load_and_process_data():
     if not os.path.exists(DB_NAME):
         return pd.DataFrame()
@@ -110,14 +118,21 @@ def load_and_process_data():
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values('timestamp').reset_index(drop=True)
         
-        # Calculate Trend Indicators
+        # Trend Indicators
         df['ema_100'] = df['mid_price'].ewm(span=100, adjust=False).mean()
         df['cvd_slope'] = df['cvd_acceleration'].rolling(window=10, min_periods=1).mean()
         
-        # Calculate ATR
+        # Volatility (ATR)
         df['high_low'] = df['mid_price'] - df['mid_price'].shift(1)
         df['atr'] = df['high_low'].abs().rolling(window=14, min_periods=1).mean().fillna(10.0)
         
+        # ROLLING Z-SCORE NORMALIZATION (30-period window)
+        for col in ['ofi', 'cvd_acceleration', 'micro_price']:
+            mean_val = df[col].rolling(window=30, min_periods=5).mean()
+            std_val = df[col].rolling(window=30, min_periods=5).std().replace(0, 1e-5)
+            df[f'{col}_z'] = (df[col] - mean_val) / std_val
+            df[f'{col}_z'] = df[f'{col}_z'].fillna(0.0)
+
         return df
     except Exception:
         return pd.DataFrame()
@@ -134,24 +149,25 @@ else:
     current_price = float(latest.get('mid_price', 0.0))
     current_micro = float(latest.get('micro_price', current_price))
     current_ofi = float(latest.get('ofi', 0.0))
-    current_absorption = float(latest.get('absorption_ratio', 0.0))
+    current_ofi_z = float(latest.get('ofi_z', 0.0))
     current_cvd_accel = float(latest.get('cvd_acceleration', 0.0))
+    current_cvd_z = float(latest.get('cvd_acceleration_z', 0.0))
     current_ema = float(latest.get('ema_100', current_price))
     current_cvd_slope = float(latest.get('cvd_slope', 0.0))
     current_atr = max(float(latest.get('atr', 10.0)), 5.0)
 
-    # Feature Vector Construction
+    # Standardized Feature Vector Construction
     micro_spread = current_micro - current_price
     ema_diff = current_price - current_ema
-    feature_vector = [micro_spread, current_ofi, current_absorption, current_cvd_accel, ema_diff, current_atr]
+    feature_vector = [micro_spread, current_ofi_z, current_cvd_z, ema_diff, current_atr, current_cvd_slope]
     
     ml_prob_long = predict_signal_probability(feature_vector)
     ml_prob_short = 1.0 - ml_prob_long
 
     # 1. TOP METRICS DASHBOARD
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Micro-Price", f"${current_micro:,.2f}")
-    col2.metric("OFI Signal", f"{current_ofi:,.2f}")
+    col1.metric("Mid Price", f"${current_price:,.2f}")
+    col2.metric("OFI Z-Score", f"{current_ofi_z:+.2f} σ", delta=f"Raw: {current_ofi:.1f}")
     col3.metric("Macro EMA (100)", f"${current_ema:,.2f}")
     col4.metric("Live ATR Volatility", f"${current_atr:,.2f}")
     col5.metric("ML Long Prob.", f"{ml_prob_long:.2%}")
@@ -159,22 +175,20 @@ else:
     # 2. MICROSTRUCTURE & TREND CHART
     st.subheader("📈 Microstructure & Trend Regime Chart")
     fig = go.Figure()
-    
-    # Mid Price line (Solid Green)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], name="Mid Price", line=dict(color="#00FFA3", width=2.5)))
-    # Micro-Price line (Dashed Pink)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['micro_price'], name="Micro-Price", line=dict(color="#FF007A", width=1.5, dash='dash')))
-    # 100 EMA Trend line (Dotted Blue)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema_100'], name="100 EMA Trend", line=dict(color="#00E5FF", width=1.5, dash='dot')))
-    
     fig.update_layout(template="plotly_dark", height=380, margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    # 3. ML PAPER TRADING EXECUTION ENGINE
+    # 3. ML PAPER TRADING EXECUTION ENGINE (WITH FRICTION)
     st.markdown("---")
-    st.subheader("🤖 Live ML Paper Trader Engine")
+    st.subheader("🤖 Institutional ML Execution Engine (Net PnL Mode)")
 
     if enable_paper_trader:
+        # Calculate dynamic slippage penalty
+        slippage_penalty = current_atr * slippage_atr_pct
+
         if st.session_state.positions:
             for pos in list(st.session_state.positions):
                 entry_price = pos["entry_price"]
@@ -183,13 +197,22 @@ else:
                 sl_val = pos["sl"]
                 conf = pos["confidence"]
                 
-                pnl = (current_price - entry_price) if side == "LONG" else (entry_price - current_price)
+                # Gross PnL
+                gross_pnl = (current_price - entry_price) if side == "LONG" else (entry_price - current_price)
                 
-                if pnl >= tp_val or pnl <= -sl_val:
-                    exit_reason = "DYNAMIC TP 🎯" if pnl >= tp_val else "DYNAMIC SL 🛑"
+                # Calculate Taker Fee + Slippage Friction
+                total_trade_notional = entry_price + current_price
+                total_fees = total_trade_notional * taker_fee_rate
+                total_slippage = slippage_penalty * 2.0  # Entry + Exit slippage
+                total_friction = total_fees + total_slippage
+                
+                net_pnl = gross_pnl - total_friction
+                
+                if gross_pnl >= tp_val or gross_pnl <= -sl_val:
+                    exit_reason = "DYNAMIC TP 🎯" if gross_pnl >= tp_val else "DYNAMIC SL 🛑"
                     time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
                     
-                    log_trade_to_db(time_str, side, entry_price, current_price, pnl, exit_reason, conf)
+                    log_trade_to_db(time_str, side, entry_price, current_price, gross_pnl, net_pnl, total_friction, exit_reason, conf)
                     st.session_state.positions.remove(pos)
 
         if not st.session_state.positions:
@@ -199,48 +222,53 @@ else:
             calculated_sl = current_atr * atr_sl_mult
             calculated_tp = current_atr * atr_tp_mult
             
-            if is_bullish_regime and ml_prob_long >= min_confidence and current_ofi > 0.05:
+            # Execute with Slippage Price Adjustment
+            if is_bullish_regime and ml_prob_long >= min_confidence and current_ofi_z > z_threshold:
+                executed_entry = current_price + slippage_penalty
                 st.session_state.positions.append({
-                    "entry_price": current_price,
+                    "entry_price": executed_entry,
                     "side": "LONG",
                     "sl": calculated_sl,
                     "tp": calculated_tp,
                     "confidence": ml_prob_long,
                     "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                st.success("🚀 ML Executed LONG @ $" + f"{current_price:,.2f}" + " | Prob: " + f"{ml_prob_long:.2%}" + " | Dynamic SL: $" + f"{calculated_sl:.2f}" + " | TP: $" + f"{calculated_tp:.2f}")
+                st.success(f"🚀 ML Executed LONG @ ${executed_entry:,.2f} (Incl. ${slippage_penalty:.2f} Slippage) | Prob: {ml_prob_long:.2%} | Z-OFI: {current_ofi_z:+.2f}σ")
             
-            elif is_bearish_regime and ml_prob_short >= min_confidence and current_ofi < -0.05:
+            elif is_bearish_regime and ml_prob_short >= min_confidence and current_ofi_z < -z_threshold:
+                executed_entry = current_price - slippage_penalty
                 st.session_state.positions.append({
-                    "entry_price": current_price,
+                    "entry_price": executed_entry,
                     "side": "SHORT",
                     "sl": calculated_sl,
                     "tp": calculated_tp,
                     "confidence": ml_prob_short,
                     "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                st.success("🔻 ML Executed SHORT @ $" + f"{current_price:,.2f}" + " | Prob: " + f"{ml_prob_short:.2%}" + " | Dynamic SL: $" + f"{calculated_sl:.2f}" + " | TP: $" + f"{calculated_tp:.2f}")
+                st.success(f"🔻 ML Executed SHORT @ ${executed_entry:,.2f} (Incl. ${slippage_penalty:.2f} Slippage) | Prob: {ml_prob_short:.2%} | Z-OFI: {current_ofi_z:+.2f}σ")
             
             else:
-                st.info("🔍 ML Scanner Active: Scanning for setups...")
+                st.info("🔍 ML Scanner Active: Monitoring Z-Score Imbalances...")
 
         if st.session_state.positions:
             active = st.session_state.positions[0]
             entry_p = active["entry_price"]
             s = active["side"]
-            live_pnl = (current_price - entry_p) if s == "LONG" else (entry_p - current_price)
+            live_gross = (current_price - entry_p) if s == "LONG" else (entry_p - current_price)
+            live_friction = (entry_p + current_price) * taker_fee_rate + (slippage_penalty * 2)
+            live_net = live_gross - live_friction
             
             p_col1, p_col2, p_col3, p_col4, p_col5 = st.columns(5)
             p_col1.metric("Active Order", f"{s}")
-            p_col2.metric("Entry Price", f"${entry_p:,.2f}")
-            p_col3.metric("Current Price", f"${current_price:,.2f}")
-            p_col4.metric("Unrealized PnL", f"${live_pnl:,.2f}", delta=f"${live_pnl:,.2f}")
+            p_col2.metric("Entry (Net Slippage)", f"${entry_p:,.2f}")
+            p_col3.metric("Gross PnL", f"${live_gross:,.2f}")
+            p_col4.metric("Net PnL (After Friction)", f"${live_net:,.2f}", delta=f"-${live_friction:.2f} Fees/Slippage")
             p_col5.metric("Target SL / TP", f"-${active['sl']:.1f} / +${active['tp']:.1f}")
 
     # 4. PERSISTENT CLOSED TRADE HISTORY TABLE
     trades_df = load_trade_history()
     if not trades_df.empty:
-        st.subheader("📜 Over-Night Executed Trade Logs")
+        st.subheader("📜 Over-Night Executed Trade Logs (Net Performance)")
         st.dataframe(trades_df, use_container_width=True)
 
 # --- 8. NATIVE AUTO-RERUN (EVERY 3 SECONDS) ---
