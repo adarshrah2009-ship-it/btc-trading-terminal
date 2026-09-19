@@ -7,6 +7,7 @@ import subprocess
 import os
 import sys
 import lightgbm as lgb
+import time
 
 # --- 1. AUTOMATIC BACKGROUND PIPELINE LAUNCHER ---
 @st.cache_resource
@@ -16,14 +17,7 @@ def start_pipeline_background():
 
 start_pipeline_background()
 
-# --- 2. AUTO-REFRESH UI EVERY 3 SECONDS ---
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=3000, key="datarefresh")
-except ImportError:
-    pass
-
-# --- 3. PAGE CONFIGURATION ---
+# --- 2. PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="BTC ML & Microstructure Terminal",
     page_icon="⚡",
@@ -32,7 +26,7 @@ st.set_page_config(
 
 DB_NAME = "btc_market_structure.db"
 
-# --- 4. PERSISTENT TRADE DATABASE SETUP ---
+# --- 3. PERSISTENT TRADE DATABASE SETUP ---
 def init_trade_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -74,7 +68,7 @@ def load_trade_history():
     except Exception:
         return pd.DataFrame()
 
-# --- 5. LIGHTGBM INFERENCE ENGINE ---
+# --- 4. LIGHTGBM INFERENCE ENGINE ---
 @st.cache_resource
 def load_or_init_lgbm():
     X_dummy = np.random.randn(100, 6)
@@ -91,7 +85,7 @@ def predict_signal_probability(features):
     prob_long = lgb_model.predict(features_array)[0]
     return prob_long
 
-# --- 6. SESSION STATE & SIDEBAR CONFIG ---
+# --- 5. SESSION STATE & SIDEBAR CONFIG ---
 if "positions" not in st.session_state:
     st.session_state.positions = []
 
@@ -102,7 +96,7 @@ min_confidence = st.sidebar.slider("Min ML Probability Threshold", 0.50, 0.95, 0
 atr_sl_mult = st.sidebar.number_input("ATR Stop-Loss Multiplier", value=1.5, step=0.1)
 atr_tp_mult = st.sidebar.number_input("ATR Take-Profit Multiplier", value=3.0, step=0.1)
 
-# --- 7. DATA PROCESSING & FEATURE ENGINEERING ---
+# --- 6. DATA PROCESSING & FEATURE ENGINEERING ---
 def load_and_process_data():
     if not os.path.exists(DB_NAME):
         return pd.DataFrame()
@@ -128,7 +122,7 @@ def load_and_process_data():
     except Exception:
         return pd.DataFrame()
 
-# --- 8. MAIN INTERFACE ---
+# --- 7. MAIN INTERFACE ---
 st.title("⚡ Pro BTC Predictive Microstructure & ML Terminal")
 
 df = load_and_process_data()
@@ -248,3 +242,7 @@ else:
     if not trades_df.empty:
         st.subheader("📜 Over-Night Executed Trade Logs")
         st.dataframe(trades_df, use_container_width=True)
+
+# --- 8. NATIVE AUTO-RERUN (EVERY 3 SECONDS) ---
+time.sleep(3)
+st.rerun()
