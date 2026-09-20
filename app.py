@@ -9,27 +9,23 @@ import sys
 import lightgbm as lgb
 import time
 
-# --- 1. AUTOMATIC BACKGROUND PIPELINE LAUNCHER ---
-@st.cache_resource
-def start_pipeline_background():
-    if os.path.exists("pipeline.py"):
-        return subprocess.Popen([sys.executable, "pipeline.py"])
-
-pipeline_process = start_pipeline_background()
-
-# --- 2. PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="BTC Quant Microstructure & ML Terminal",
-    page_icon="⚡",
-    layout="wide"
-)
-
+# --- 1. AUTOMATIC BACKGROUND PIPELINE & DB INITIALIZER ---
 DB_NAME = "btc_market_structure.db"
 
-# --- 3. PERSISTENT TRADE DATABASE SETUP ---
-def init_trade_db():
+def ensure_db_seeded():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS market_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            mid_price REAL,
+            micro_price REAL,
+            ofi REAL,
+            mlofi REAL,
+            cvd_acceleration REAL
+        )
+    ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS paper_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,20 +41,41 @@ def init_trade_db():
         )
     ''')
     conn.commit()
+    
+    # Check if market_data has entries; if empty, seed initial data instantly
+    cursor.execute("SELECT COUNT(*) FROM market_data")
+    count = cursor.fetchone()[0]
+    if count == 0:
+        now = pd.Timestamp.now()
+        base_price = 80472.50
+        rows = []
+        for i in range(30):
+            ts = (now - pd.Timedelta(seconds=30 - i)).strftime("%Y-%m-%d %H:%M:%S")
+            p = base_price + np.random.randn() * 10
+            rows.append((ts, p, p + 0.5, np.random.randn(), np.random.randn(), np.random.randn()))
+        
+        cursor.executemany('''
+            INSERT INTO market_data (timestamp, mid_price, micro_price, ofi, mlofi, cvd_acceleration)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', rows)
+        conn.commit()
     conn.close()
 
-init_trade_db()
+ensure_db_seeded()
 
-def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO paper_trades 
-        (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence))
-    conn.commit()
-    conn.close()
+@st.cache_resource
+def start_pipeline_background():
+    if os.path.exists("pipeline.py"):
+        return subprocess.Popen([sys.executable, "pipeline.py"])
+
+pipeline_process = start_pipeline_background()
+
+# --- 2. PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="BTC Quant Microstructure & ML Terminal",
+    page_icon="⚡",
+    layout="wide"
+)
 
 def load_trade_history():
     if not os.path.exists(DB_NAME):
@@ -71,7 +88,18 @@ def load_trade_history():
     except Exception:
         return pd.DataFrame()
 
-# --- 4. LIGHTGBM INFERENCE ENGINE ---
+def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO paper_trades 
+        (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence))
+    conn.commit()
+    conn.close()
+
+# --- 3. LIGHTGBM INFERENCE ENGINE ---
 @st.cache_resource
 def load_or_init_lgbm():
     X_dummy = np.random.randn(100, 6)
@@ -88,7 +116,7 @@ def predict_signal_probability(features):
     prob_long = lgb_model.predict(features_array)[0]
     return prob_long
 
-# --- 5. SESSION STATE & SIDEBAR CONFIG ---
+# --- 4. SESSION STATE & SIDEBAR CONFIG ---
 if "positions" not in st.session_state:
     st.session_state.positions = []
 
@@ -104,7 +132,7 @@ slippage_atr_pct = st.sidebar.number_input("Slippage (% of ATR)", value=10.0, st
 atr_sl_mult = st.sidebar.number_input("ATR Stop-Loss Multiplier", value=1.5, step=0.1)
 atr_tp_mult = st.sidebar.number_input("ATR Take-Profit Multiplier", value=3.0, step=0.1)
 
-# --- 6. DATA PROCESSING & ROLLING Z-SCORE NORMALIZATION ---
+# --- 5. DATA PROCESSING & ROLLING Z-SCORE NORMALIZATION ---
 def load_and_process_data():
     if not os.path.exists(DB_NAME):
         return pd.DataFrame()
@@ -129,8 +157,8 @@ def load_and_process_data():
         # ROLLING Z-SCORE NORMALIZATION (30-period window)
         for col in ['ofi', 'mlofi', 'cvd_acceleration', 'micro_price']:
             if col in df.columns:
-                mean_val = df[col].rolling(window=30, min_periods=5).mean()
-                std_val = df[col].rolling(window=30, min_periods=5).std().replace(0, 1e-5)
+                mean_val = df[col].rolling(window=30, min_periods=1).mean()
+                std_val = df[col].rolling(window=30, min_periods=1).std().fillna(1.0).replace(0, 1e-5)
                 df[f'{col}_z'] = (df[col] - mean_val) / std_val
                 df[f'{col}_z'] = df[f'{col}_z'].fillna(0.0)
 
@@ -138,7 +166,7 @@ def load_and_process_data():
     except Exception:
         return pd.DataFrame()
 
-# --- 7. MAIN INTERFACE ---
+# --- 6. MAIN INTERFACE ---
 st.title("⚡ Pro BTC Predictive Microstructure & ML Terminal")
 
 df = load_and_process_data()
@@ -268,6 +296,6 @@ else:
         st.subheader("📜 Over-Night Executed Trade Logs (Net Performance)")
         st.dataframe(trades_df, use_container_width=True)
 
-# --- 8. NATIVE AUTO-RERUN (EVERY 3 SECONDS) ---
+# --- 7. NATIVE AUTO-RERUN (EVERY 3 SECONDS) ---
 time.sleep(3)
 st.rerun()
