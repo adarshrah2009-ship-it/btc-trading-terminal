@@ -2,262 +2,272 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import numpy as np
-import time
+import plotly.graph_objects as go
+import subprocess
 import os
-import importlib
-import plotly.express as px
+import sys
+import lightgbm as lgb
+import time
 
-def get_ai_prediction(features):
-    try:
-        import ai_engine
-        importlib.reload(ai_engine)
-        prob = ai_engine.predict_trade_probability(features)
-        return float(prob)
-    except Exception as e:
-        st.sidebar.warning(f"⚠️ AI Engine Alert: {str(e)}")
-        return 0.60 
+# --- 1. AUTOMATIC BACKGROUND PIPELINE LAUNCHER ---
+@st.cache_resource
+def start_pipeline_background():
+    if os.path.exists("pipeline.py"):
+        return subprocess.Popen([sys.executable, "pipeline.py"])
 
-def run_ai_training():
-    try:
-        import ai_engine
-        importlib.reload(ai_engine)
-        return ai_engine.train_local_ai()
-    except Exception as e:
-        return f"Error loading ai_engine.py: {str(e)}"
+pipeline_process = start_pipeline_background()
 
-st.set_page_config(page_title="Pro BTC Microstructure Terminal", layout="wide")
+# --- 2. PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="BTC Quant Microstructure & ML Terminal",
+    page_icon="⚡",
+    layout="wide"
+)
 
 DB_NAME = "btc_market_structure.db"
 
-# Session State
-if "capital" not in st.session_state:
-    st.session_state.capital = 10000.0
-if "position" not in st.session_state:
-    st.session_state.position = None
-if "entry_price" not in st.session_state:
-    st.session_state.entry_price = 0.0
-if "scalp_count" not in st.session_state:
-    st.session_state.scalp_count = 0
-if "wins" not in st.session_state:
-    st.session_state.wins = 0
-if "realized_pnl" not in st.session_state:
-    st.session_state.realized_pnl = 0.0
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = []
-if "chart_key_counter" not in st.session_state:
-    st.session_state.chart_key_counter = 0
+# --- 3. PERSISTENT TRADE DATABASE SETUP ---
+def init_trade_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            side TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            gross_pnl REAL,
+            net_pnl REAL,
+            fee_slippage REAL,
+            status TEXT,
+            ml_confidence REAL
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-# Sidebar Settings
-st.sidebar.title("⚙️ Terminal Config")
-enable_trader = st.sidebar.toggle("Enable AI Paper Trader", value=True)
-min_ai_conf = st.sidebar.slider("Min AI Confidence Threshold", 0.50, 0.90, 0.65, 0.05)
-position_size = st.sidebar.number_input("Position Size ($)", value=2000.0, step=100.0)
-tp_dist = st.sidebar.number_input("Take Profit ($)", value=50.0, step=10.0)
-sl_dist = st.sidebar.number_input("Stop Loss ($)", value=25.0, step=5.0)
-fee_pct = st.sidebar.number_input("Binance Fee %", value=0.04, step=0.01) / 100.0
+init_trade_db()
 
-st.sidebar.markdown("---")
-if st.sidebar.button("⚡ Retrain AI Model"):
-    training_msg = run_ai_training()
-    st.sidebar.info(training_msg)
+def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO paper_trades 
+        (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence))
+    conn.commit()
+    conn.close()
 
-st.title("⚡ Pro BTC Predictive Microstructure Terminal")
-
-placeholder = st.empty()
-
-def load_latest_data():
+def load_trade_history():
     if not os.path.exists(DB_NAME):
-        return None, None
+        return pd.DataFrame()
     try:
-        conn = sqlite3.connect(f"file:{DB_NAME}?mode=ro", uri=True)
-        trades = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 500", conn)
-        ob = pd.read_sql_query("SELECT * FROM orderbook_snapshots ORDER BY timestamp DESC LIMIT 20", conn)
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 100", conn)
         conn.close()
-        
-        if trades.empty:
-            return None, None
-        return trades, ob
+        return df
     except Exception:
-        return None, None
+        return pd.DataFrame()
 
-while True:
-    st.session_state.chart_key_counter += 1
-    trades, ob = load_latest_data()
-    
-    if trades is None or trades.empty:
-        with placeholder.container():
-            st.warning("⏳ Waiting for database entries from pipeline.py...")
-        time.sleep(1)
-        continue
+# --- 4. LIGHTGBM INFERENCE ENGINE ---
+@st.cache_resource
+def load_or_init_lgbm():
+    X_dummy = np.random.randn(100, 6)
+    y_dummy = np.random.randint(0, 2, size=100)
+    train_data = lgb.Dataset(X_dummy, label=y_dummy)
+    params = {'objective': 'binary', 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 15}
+    model = lgb.train(params, train_data, num_boost_round=10)
+    return model
 
-    latest_price = trades.iloc[0]['price']
-    trades_chrono = trades.sort_values('timestamp').copy()
-    
-    # 1. Feature Calculations
-    trades_chrono['signed_vol'] = trades_chrono.apply(lambda r: r['quantity'] if r['is_buyer_maker'] == 0 else -r['quantity'], axis=1)
-    trades_chrono['buy_vol'] = trades_chrono.apply(lambda r: r['quantity'] if r['is_buyer_maker'] == 0 else 0.0, axis=1)
-    trades_chrono['sell_vol'] = trades_chrono.apply(lambda r: r['quantity'] if r['is_buyer_maker'] == 1 else 0.0, axis=1)
-    
-    buy_vol_total = trades_chrono['buy_vol'].sum()
-    sell_vol_total = trades_chrono['sell_vol'].sum()
-    delta = buy_vol_total - sell_vol_total
-    cvd = trades_chrono['signed_vol'].sum()
-    vwap = (trades_chrono['price'] * trades_chrono['quantity']).sum() / trades_chrono['quantity'].sum()
-    
-    trades_chrono['cvd_series'] = trades_chrono['signed_vol'].cumsum()
-    trades_chrono['aggression_ratio'] = (trades_chrono['buy_vol'].rolling(20).sum() + 1e-9) / (trades_chrono['sell_vol'].rolling(20).sum() + 1e-9)
-    trades_chrono['cvd_accel'] = trades_chrono['cvd_series'] - trades_chrono['cvd_series'].shift(20)
+lgb_model = load_or_init_lgbm()
 
-    latest_row = trades_chrono.iloc[-1]
-    
-    # Orderbook Features
-    obi = ob.iloc[0]['obi'] if (ob is not None and not ob.empty and 'obi' in ob.columns) else 0.0
-    bids_vol = ob.iloc[0]['bids_vol'] if (ob is not None and not ob.empty and 'bids_vol' in ob.columns) else 0.0
-    asks_vol = ob.iloc[0]['asks_vol'] if (ob is not None and not ob.empty and 'asks_vol' in ob.columns) else 0.0
-    depth_ratio = (bids_vol + 1e-9) / (asks_vol + 1e-9)
-    absorption = (latest_row['buy_vol'] + 1e-9) / (asks_vol + 1e-9)
-    
-    ofi = 0.0
-    if ob is not None and len(ob) > 1 and 'bids_vol' in ob.columns:
-        ofi = (ob.iloc[0]['bids_vol'] - ob.iloc[1]['bids_vol']) - (ob.iloc[0]['asks_vol'] - ob.iloc[1]['asks_vol'])
+def predict_signal_probability(features):
+    features_array = np.array(features).reshape(1, -1)
+    prob_long = lgb_model.predict(features_array)[0]
+    return prob_long
 
-    # Micro-Price Calculation
-    micro_price = (asks_vol * (latest_price - 0.5) + bids_vol * (latest_price + 0.5)) / (bids_vol + asks_vol + 1e-9) if (bids_vol + asks_vol) > 0 else latest_price
+# --- 5. SESSION STATE & SIDEBAR CONFIG ---
+if "positions" not in st.session_state:
+    st.session_state.positions = []
 
-    # Confluence Score
-    score = 0
-    if latest_price > vwap: score += 1
-    else: score -= 1
-    
-    if delta > 0.5: score += 1
-    elif delta < -0.5: score -= 1
-    
-    if obi > 0.1: score += 1
-    elif obi < -0.1: score -= 1
+st.sidebar.title("⚙️ Institutional Config")
+enable_paper_trader = st.sidebar.toggle("Enable ML Paper Trader", value=True)
+min_confidence = st.sidebar.slider("Min ML Probability Threshold", 0.50, 0.95, 0.65, 0.05)
+z_threshold = st.sidebar.slider("Min OFI Z-Score Threshold (σ)", 1.0, 3.0, 1.5, 0.1)
 
-    current_features = {
-        'signed_vol': float(latest_row['signed_vol']),
-        'cvd': float(cvd),
-        'vwap_dist': float(latest_price - vwap),
-        'aggression_ratio': float(latest_row['aggression_ratio']) if not np.isnan(latest_row['aggression_ratio']) else 1.0,
-        'cvd_accel': float(latest_row['cvd_accel']) if not np.isnan(latest_row['cvd_accel']) else 0.0,
-        'obi': float(obi),
-        'depth_ratio': float(depth_ratio),
-        'absorption_ratio': float(absorption),
-        'ofi': float(ofi)
-    }
+st.sidebar.subheader("Execution Friction Model")
+taker_fee_rate = st.sidebar.number_input("Taker Fee Rate (%)", value=0.05, step=0.01) / 100.0
+slippage_atr_pct = st.sidebar.number_input("Slippage (% of ATR)", value=10.0, step=1.0) / 100.0
 
-    ai_prob = get_ai_prediction(current_features)
+atr_sl_mult = st.sidebar.number_input("ATR Stop-Loss Multiplier", value=1.5, step=0.1)
+atr_tp_mult = st.sidebar.number_input("ATR Take-Profit Multiplier", value=3.0, step=0.1)
 
-    # Paper Execution Logic
-    if enable_trader:
-        if st.session_state.position is None:
-            if score >= 2 and ai_prob >= min_ai_conf:
-                st.session_state.position = "LONG"
-                st.session_state.entry_price = latest_price
-            elif score <= -2 and ai_prob >= min_ai_conf:
-                st.session_state.position = "SHORT"
-                st.session_state.entry_price = latest_price
+# --- 6. DATA PROCESSING & ROLLING Z-SCORE NORMALIZATION ---
+def load_and_process_data():
+    if not os.path.exists(DB_NAME):
+        return pd.DataFrame()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        df = pd.read_sql_query("SELECT * FROM market_data ORDER BY id DESC LIMIT 300", conn)
+        conn.close()
+        if df.empty:
+            return pd.DataFrame()
+            
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp').reset_index(drop=True)
         
-        elif st.session_state.position == "LONG":
-            pnl = latest_price - st.session_state.entry_price
-            if pnl >= tp_dist or pnl <= -sl_dist:
-                net_pnl = (pnl / st.session_state.entry_price * position_size) - (position_size * fee_pct * 2)
-                st.session_state.capital += net_pnl
-                st.session_state.realized_pnl += net_pnl
-                st.session_state.scalp_count += 1
-                if net_pnl > 0: st.session_state.wins += 1
-                st.session_state.trade_history.append({
-                    "Side": "LONG", "Entry": f"${st.session_state.entry_price:,.2f}",
-                    "Exit": f"${latest_price:,.2f}", "PnL": f"${net_pnl:+.2f}"
+        # Trend Indicators
+        df['ema_100'] = df['mid_price'].ewm(span=100, adjust=False).mean()
+        df['cvd_slope'] = df['cvd_acceleration'].rolling(window=10, min_periods=1).mean()
+        
+        # Volatility (ATR)
+        df['high_low'] = df['mid_price'] - df['mid_price'].shift(1)
+        df['atr'] = df['high_low'].abs().rolling(window=14, min_periods=1).mean().fillna(10.0)
+        
+        # ROLLING Z-SCORE NORMALIZATION (30-period window)
+        for col in ['ofi', 'mlofi', 'cvd_acceleration', 'micro_price']:
+            if col in df.columns:
+                mean_val = df[col].rolling(window=30, min_periods=5).mean()
+                std_val = df[col].rolling(window=30, min_periods=5).std().replace(0, 1e-5)
+                df[f'{col}_z'] = (df[col] - mean_val) / std_val
+                df[f'{col}_z'] = df[f'{col}_z'].fillna(0.0)
+
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# --- 7. MAIN INTERFACE ---
+st.title("⚡ Pro BTC Predictive Microstructure & ML Terminal")
+
+df = load_and_process_data()
+
+if df.empty:
+    st.warning("⏳ Connecting to exchange WebSocket stream & populating SQLite entries...")
+else:
+    latest = df.iloc[-1]
+    current_price = float(latest.get('mid_price', 0.0))
+    current_micro = float(latest.get('micro_price', current_price))
+    current_ofi = float(latest.get('ofi', 0.0))
+    current_ofi_z = float(latest.get('ofi_z', 0.0))
+    current_mlofi_z = float(latest.get('mlofi_z', 0.0))
+    current_cvd_z = float(latest.get('cvd_acceleration_z', 0.0))
+    current_ema = float(latest.get('ema_100', current_price))
+    current_cvd_slope = float(latest.get('cvd_slope', 0.0))
+    current_atr = max(float(latest.get('atr', 10.0)), 5.0)
+
+    # Standardized Feature Vector Construction
+    micro_spread = current_micro - current_price
+    ema_diff = current_price - current_ema
+    feature_vector = [micro_spread, current_mlofi_z, current_cvd_z, ema_diff, current_atr, current_cvd_slope]
+    
+    ml_prob_long = predict_signal_probability(feature_vector)
+    ml_prob_short = 1.0 - ml_prob_long
+
+    # 1. TOP METRICS DASHBOARD
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Mid Price", f"${current_price:,.2f}")
+    col2.metric("MLOFI Z-Score", f"{current_mlofi_z:+.2f} σ", delta=f"L1 OFI Z: {current_ofi_z:+.2f}σ")
+    col3.metric("Macro EMA (100)", f"${current_ema:,.2f}")
+    col4.metric("Live ATR Volatility", f"${current_atr:,.2f}")
+    col5.metric("ML Long Prob.", f"{ml_prob_long:.2%}")
+
+    # 2. MICROSTRUCTURE & TREND CHART
+    st.subheader("📈 Microstructure & Trend Regime Chart")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], name="Mid Price", line=dict(color="#00FFA3", width=2.5)))
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['micro_price'], name="Micro-Price", line=dict(color="#FF007A", width=1.5, dash='dash')))
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema_100'], name="100 EMA Trend", line=dict(color="#00E5FF", width=1.5, dash='dot')))
+    fig.update_layout(template="plotly_dark", height=380, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 3. ML PAPER TRADING EXECUTION ENGINE (WITH FRICTION)
+    st.markdown("---")
+    st.subheader("🤖 Institutional ML Execution Engine (Net PnL Mode)")
+
+    if enable_paper_trader:
+        slippage_penalty = current_atr * slippage_atr_pct
+
+        if st.session_state.positions:
+            for pos in list(st.session_state.positions):
+                entry_price = pos["entry_price"]
+                side = pos["side"]
+                tp_val = pos["tp"]
+                sl_val = pos["sl"]
+                conf = pos["confidence"]
+                
+                gross_pnl = (current_price - entry_price) if side == "LONG" else (entry_price - current_price)
+                
+                total_trade_notional = entry_price + current_price
+                total_fees = total_trade_notional * taker_fee_rate
+                total_slippage = slippage_penalty * 2.0
+                total_friction = total_fees + total_slippage
+                
+                net_pnl = gross_pnl - total_friction
+                
+                if gross_pnl >= tp_val or gross_pnl <= -sl_val:
+                    exit_reason = "DYNAMIC TP 🎯" if gross_pnl >= tp_val else "DYNAMIC SL 🛑"
+                    time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    log_trade_to_db(time_str, side, entry_price, current_price, gross_pnl, net_pnl, total_friction, exit_reason, conf)
+                    st.session_state.positions.remove(pos)
+
+        if not st.session_state.positions:
+            is_bullish_regime = (current_price > current_ema) and (current_cvd_slope >= 0)
+            is_bearish_regime = (current_price < current_ema) and (current_cvd_slope <= 0)
+            
+            calculated_sl = current_atr * atr_sl_mult
+            calculated_tp = current_atr * atr_tp_mult
+            
+            if is_bullish_regime and ml_prob_long >= min_confidence and current_mlofi_z > z_threshold:
+                executed_entry = current_price + slippage_penalty
+                st.session_state.positions.append({
+                    "entry_price": executed_entry,
+                    "side": "LONG",
+                    "sl": calculated_sl,
+                    "tp": calculated_tp,
+                    "confidence": ml_prob_long,
+                    "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                st.session_state.position = None
-
-        elif st.session_state.position == "SHORT":
-            pnl = st.session_state.entry_price - latest_price
-            if pnl >= tp_dist or pnl <= -sl_dist:
-                net_pnl = (pnl / st.session_state.entry_price * position_size) - (position_size * fee_pct * 2)
-                st.session_state.capital += net_pnl
-                st.session_state.realized_pnl += net_pnl
-                st.session_state.scalp_count += 1
-                if net_pnl > 0: st.session_state.wins += 1
-                st.session_state.trade_history.append({
-                    "Side": "SHORT", "Entry": f"${st.session_state.entry_price:,.2f}",
-                    "Exit": f"${latest_price:,.2f}", "PnL": f"${net_pnl:+.2f}"
+                st.success(f"🚀 ML Executed LONG @ ${executed_entry:,.2f} (Incl. ${slippage_penalty:.2f} Slippage) | Prob: {ml_prob_long:.2%} | Z-MLOFI: {current_mlofi_z:+.2f}σ")
+            
+            elif is_bearish_regime and ml_prob_short >= min_confidence and current_mlofi_z < -z_threshold:
+                executed_entry = current_price - slippage_penalty
+                st.session_state.positions.append({
+                    "entry_price": executed_entry,
+                    "side": "SHORT",
+                    "sl": calculated_sl,
+                    "tp": calculated_tp,
+                    "confidence": ml_prob_short,
+                    "timestamp": pd.Timestamp.now().strftime("%H:%M:%S")
                 })
-                st.session_state.position = None
-
-    win_rate = (st.session_state.wins / st.session_state.scalp_count * 100) if st.session_state.scalp_count > 0 else 0.0
-
-    # Live Floating PnL
-    unrealized_pnl = 0.0
-    if st.session_state.position == "LONG":
-        price_diff = latest_price - st.session_state.entry_price
-        unrealized_pnl = (price_diff / st.session_state.entry_price) * position_size
-    elif st.session_state.position == "SHORT":
-        price_diff = st.session_state.entry_price - latest_price
-        unrealized_pnl = (price_diff / st.session_state.entry_price) * position_size
-
-    # UI Rendering
-    with placeholder.container():
-        if score >= 2:
-            st.success(f"🟢 **BULLISH LIQUIDITY SWEEP DETECTED** | Signal Score: +{score} | AI Breakout Prob: {ai_prob*100:.1f}%")
-        elif score <= -2:
-            st.error(f"🔴 **BEARISH LIQUIDITY SWEEP DETECTED** | Signal Score: {score} | AI Breakout Prob: {ai_prob*100:.1f}%")
-        else:
-            st.warning(f"🟡 **MARKET RANGING / NEUTRAL** | Signal Score: {score} | AI Breakout Prob: {ai_prob*100:.1f}%")
-
-        # Top Metric Cards
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Paper Capital", f"${st.session_state.capital:,.2f}", f"{st.session_state.realized_pnl:+.2f} USDT")
-        col2.metric("Total Scalps", f"{st.session_state.scalp_count}")
-        col3.metric("Win Rate", f"{win_rate:.1f}%")
-
-        if st.session_state.position:
-            col4.metric(
-                label=f"Active {st.session_state.position}", 
-                value=f"${st.session_state.entry_price:,.2f}", 
-                delta=f"Unrealized PnL: ${unrealized_pnl:+.2f}"
-            )
-        else:
-            col4.metric("Active Position", "FLAT")
-
-        # Microstructure Bar
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Live Price", f"${latest_price:,.2f}")
-        m2.metric("Micro-Price", f"${micro_price:,.2f}")
-        m3.metric("OFI Imbalance", f"{ofi:+.2f}")
-        m4.metric("CVD Accel", f"{latest_row['cvd_accel']:+.2f}" if not np.isnan(latest_row['cvd_accel']) else "+0.00")
-        m5.metric("Absorption Ratio", f"{absorption:.2f}")
-
-        st.markdown("---")
-
-        chart_col, log_col = st.columns([2, 1])
-
-        with chart_col:
-            st.subheader("📈 Real-Time Price vs VWAP")
-            chart_df = trades_chrono[['timestamp', 'price']].copy()
-            chart_df['vwap'] = vwap
+                st.success(f"🔻 ML Executed SHORT @ ${executed_entry:,.2f} (Incl. ${slippage_penalty:.2f} Slippage) | Prob: {ml_prob_short:.2%} | Z-MLOFI: {current_mlofi_z:+.2f}σ")
             
-            fig = px.line(chart_df, x='timestamp', y=['price', 'vwap'], 
-                          color_discrete_map={'price': '#00E676', 'vwap': '#FFEA00'})
-            
-            min_p = min(chart_df['price'].min(), vwap) - 5
-            max_p = max(chart_df['price'].max(), vwap) + 5
-            fig.update_layout(
-                yaxis_range=[min_p, max_p], 
-                margin=dict(l=10, r=10, t=10, b=10), 
-                height=340,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            
-            st.plotly_chart(fig, use_container_width=True, key=f"btc_chart_{st.session_state.chart_key_counter}")
-
-        with log_col:
-            st.subheader("📋 Executed Trades")
-            if st.session_state.trade_history:
-                st.dataframe(pd.DataFrame(st.session_state.trade_history[::-1]), height=320, use_container_width=True)
             else:
-                st.caption("Waiting for predictive sweep signals...")
+                st.info("🔍 ML Scanner Active: Monitoring Z-Score Imbalances...")
 
-    time.sleep(1)
+        if st.session_state.positions:
+            active = st.session_state.positions[0]
+            entry_p = active["entry_price"]
+            s = active["side"]
+            live_gross = (current_price - entry_p) if s == "LONG" else (entry_p - current_price)
+            live_friction = (entry_p + current_price) * taker_fee_rate + (slippage_penalty * 2)
+            live_net = live_gross - live_friction
+            
+            p_col1, p_col2, p_col3, p_col4, p_col5 = st.columns(5)
+            p_col1.metric("Active Order", f"{s}")
+            p_col2.metric("Entry (Net Slippage)", f"${entry_p:,.2f}")
+            p_col3.metric("Gross PnL", f"${live_gross:,.2f}")
+            p_col4.metric("Net PnL (After Friction)", f"${live_net:,.2f}", delta=f"-${live_friction:.2f} Fees/Slippage")
+            p_col5.metric("Target SL / TP", f"-${active['sl']:.1f} / +${active['tp']:.1f}")
+
+    # 4. PERSISTENT CLOSED TRADE HISTORY TABLE
+    trades_df = load_trade_history()
+    if not trades_df.empty:
+        st.subheader("📜 Over-Night Executed Trade Logs (Net Performance)")
+        st.dataframe(trades_df, use_container_width=True)
+
+# --- 8. NATIVE AUTO-RERUN (EVERY 3 SECONDS) ---
+time.sleep(3)
+st.rerun()
