@@ -3,5 +3,5 @@ pandas
 numpy
 plotly
 lightgbm
-aiohttp
-websockets
+requests
+psycopg2-binary
