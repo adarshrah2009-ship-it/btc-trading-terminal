@@ -1,12 +1,12 @@
 import streamlit as st
 import sqlite3
+import psycopg2
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 import lightgbm as lgb
-import time
 import requests
 
 # --- 1. PAGE CONFIGURATION ---
@@ -16,46 +16,74 @@ st.set_page_config(
     layout="wide"
 )
 
-DB_NAME = "btc_market_structure.db"
+DB_URI = os.getenv("DATABASE_URL")
+LOCAL_DB_NAME = "btc_market_structure.db"
 
-# --- 2. PERSISTENT DATABASE SETUP ---
+# --- 2. PERSISTENT DATABASE CONNECTOR ---
+def get_db_connection():
+    if DB_URI:
+        uri = DB_URI.replace("postgres://", "postgresql://")
+        return psycopg2.connect(uri), "pg"
+    else:
+        return sqlite3.connect(LOCAL_DB_NAME), "sqlite"
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn, db_type = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS market_data (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            mid_price REAL,
-            micro_price REAL,
-            ofi REAL,
-            mlofi REAL,
-            cvd_acceleration REAL
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS pair_prices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            btc_price REAL,
-            eth_price REAL,
-            sol_price REAL
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS paper_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            side TEXT,
-            entry_price REAL,
-            exit_price REAL,
-            gross_pnl REAL,
-            net_pnl REAL,
-            fee_slippage REAL,
-            status TEXT,
-            ml_confidence REAL
-        )
-    ''')
+    
+    if db_type == "pg":
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS market_data (
+                id SERIAL PRIMARY KEY,
+                timestamp VARCHAR(50),
+                mid_price DOUBLE PRECISION,
+                micro_price DOUBLE PRECISION,
+                ofi DOUBLE PRECISION,
+                mlofi DOUBLE PRECISION,
+                cvd_acceleration DOUBLE PRECISION
+            );
+            CREATE TABLE IF NOT EXISTS pair_prices (
+                id SERIAL PRIMARY KEY,
+                timestamp VARCHAR(50),
+                btc_price DOUBLE PRECISION,
+                eth_price DOUBLE PRECISION,
+                sol_price DOUBLE PRECISION
+            );
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id SERIAL PRIMARY KEY,
+                timestamp VARCHAR(50),
+                side VARCHAR(50),
+                entry_price DOUBLE PRECISION,
+                exit_price DOUBLE PRECISION,
+                gross_pnl DOUBLE PRECISION,
+                net_pnl DOUBLE PRECISION,
+                fee_slippage DOUBLE PRECISION,
+                status VARCHAR(50),
+                ml_confidence DOUBLE PRECISION
+            );
+        ''')
+    else:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS market_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                mid_price REAL, micro_price REAL, ofi REAL, mlofi REAL, cvd_acceleration REAL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pair_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                btc_price REAL, eth_price REAL, sol_price REAL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, side TEXT, entry_price REAL, exit_price REAL,
+                gross_pnl REAL, net_pnl REAL, fee_slippage REAL, status TEXT, ml_confidence REAL
+            )
+        ''')
     conn.commit()
     conn.close()
 
@@ -66,7 +94,6 @@ def fetch_multi_asset_ticker():
     timestamp_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     symbols = {'BTCUSDT': None, 'ETHUSDT': None, 'SOLUSDT': None}
     
-    # Try fetching real Binance prices
     endpoints = [
         "https://api.binance.com/api/v3/ticker/bookTicker",
         "https://api.binance.us/api/v3/ticker/bookTicker"
@@ -86,8 +113,7 @@ def fetch_multi_asset_ticker():
         except Exception:
             continue
 
-    # Fallback to persistent DB state + noise if API blocked
-    conn = sqlite3.connect(DB_NAME)
+    conn, db_type = get_db_connection()
     cursor = conn.cursor()
     
     btc = symbols['BTCUSDT']
@@ -101,40 +127,38 @@ def fetch_multi_asset_ticker():
         eth = last_row[1] + np.random.normal(0, 0.2) if last_row else 2650.0 + np.random.normal(0, 0.2)
         sol = last_row[2] + np.random.normal(0, 0.05) if last_row else 145.0 + np.random.normal(0, 0.05)
 
-    # Calculate BTC micro structure proxies
     micro = btc + np.random.normal(0, 0.2)
     ofi = np.random.normal(0, 0.3)
 
-    # Save into DB
-    cursor.execute('''
+    ph = "%s" if db_type == "pg" else "?"
+    cursor.execute(f'''
         INSERT INTO market_data (timestamp, mid_price, micro_price, ofi, mlofi, cvd_acceleration)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})
     ''', (timestamp_str, btc, micro, ofi, ofi * 1.2, ofi * 0.8))
     
-    cursor.execute('''
+    cursor.execute(f'''
         INSERT INTO pair_prices (timestamp, btc_price, eth_price, sol_price)
-        VALUES (?, ?, ?, ?)
+        VALUES ({ph}, {ph}, {ph}, {ph})
     ''', (timestamp_str, btc, eth, sol))
 
     conn.commit()
     conn.close()
 
 def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
-    conn = sqlite3.connect(DB_NAME)
+    conn, db_type = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
+    ph = "%s" if db_type == "pg" else "?"
+    cursor.execute(f'''
         INSERT INTO paper_trades 
         (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
     ''', (timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence))
     conn.commit()
     conn.close()
 
 def load_trade_history():
-    if not os.path.exists(DB_NAME):
-        return pd.DataFrame()
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn, _ = get_db_connection()
         df = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 100", conn)
         conn.close()
         return df
@@ -173,12 +197,25 @@ st.sidebar.title("⚙️ Execution Settings")
 enable_paper_trader = st.sidebar.toggle("Enable Paper Trader", value=True)
 taker_fee_rate = st.sidebar.number_input("Taker Fee Rate (%)", value=0.05, step=0.01) / 100.0
 
+# Sidebar controls for Stat-Arb strategy (Placed outside fragment to avoid layout context errors)
+selected_pair = "BTC / ETH"
+z_entry_thresh = 1.8
+if terminal_mode == "Statistical Arbitrage (Market Neutral)":
+    st.sidebar.markdown("---")
+    st.sidebar.title("⚖️ Arbitrage Settings")
+    selected_pair = st.sidebar.selectbox("Select Stat-Arb Pair", ["BTC / ETH", "BTC / SOL", "ETH / SOL"])
+    z_entry_thresh = st.sidebar.slider("Stat-Arb Entry Threshold (σ)", 1.0, 3.0, 1.8, 0.1)
+
+# Connection status badge
+if DB_URI:
+    st.sidebar.success("☁️ Connected to Cloud Supabase Postgres")
+else:
+    st.sidebar.warning("⚠️ Using Local Temporary SQLite")
+
 # --- 6. DATA LOADERS ---
 def load_directional_data():
-    if not os.path.exists(DB_NAME):
-        return pd.DataFrame()
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn, _ = get_db_connection()
         df = pd.read_sql_query("SELECT * FROM market_data ORDER BY id DESC LIMIT 60", conn)
         conn.close()
         if df.empty:
@@ -201,10 +238,8 @@ def load_directional_data():
         return pd.DataFrame()
 
 def load_pair_data():
-    if not os.path.exists(DB_NAME):
-        return pd.DataFrame()
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn, _ = get_db_connection()
         df = pd.read_sql_query("SELECT * FROM pair_prices ORDER BY id DESC LIMIT 60", conn)
         conn.close()
         if df.empty:
@@ -257,9 +292,6 @@ def render_active_strategy():
     elif terminal_mode == "Statistical Arbitrage (Market Neutral)":
         pair_df = load_pair_data()
         if not pair_df.empty and len(pair_df) > 5:
-            selected_pair = st.sidebar.selectbox("Select Stat-Arb Pair", ["BTC / ETH", "BTC / SOL", "ETH / SOL"])
-            z_entry_thresh = st.sidebar.slider("Stat-Arb Entry Threshold (σ)", 1.0, 3.0, 1.8, 0.1)
-
             if selected_pair == "BTC / ETH":
                 asset_a, asset_b = "btc_price", "eth_price"
                 name_a, name_b = "BTC", "ETH"
@@ -286,7 +318,6 @@ def render_active_strategy():
             col3.metric("Pair Price Ratio", f"{latest_ratio:.4f}")
             col4.metric("Spread Z-Score", f"{latest_z:+.2f} σ", delta="Mean Reversion Mode")
 
-            # Dual-Axis Plotly Chart
             st.subheader(f"📊 Statistical Spread & Z-Score Analysis ({selected_pair})")
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.6, 0.4])
             fig.add_trace(go.Scatter(x=pair_df['timestamp'], y=pair_df['ratio'], name="Price Ratio", line=dict(color="#00E5FF", width=2)), row=1, col=1)
@@ -300,38 +331,44 @@ def render_active_strategy():
             fig.update_layout(template="plotly_dark", height=420, margin=dict(l=10, r=10, t=20, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
-            # Statistical Arbitrage Execution Engine
             st.markdown("---")
             st.subheader("⚖️ Market-Neutral Arbitrage Execution Engine")
             
             if enable_paper_trader:
+                time_now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
                 if not st.session_state.arb_positions:
                     if latest_z > z_entry_thresh:
+                        side_label = f"SHORT {name_a} / LONG {name_b}"
                         st.session_state.arb_positions.append({
-                            "pair": selected_pair, "side": f"SHORT {name_a} / LONG {name_b}",
+                            "pair": selected_pair, "side": side_label,
                             "entry_z": latest_z, "entry_ratio": latest_ratio
                         })
+                        log_trade_to_db(time_now, side_label, price_a, 0.0, 0.0, 0.0, taker_fee_rate, "OPEN", abs(latest_z))
                         st.warning(f"🚨 Stat-Arb Executed: Short {name_a} / Long {name_b} @ Z: {latest_z:+.2f}σ")
+
                     elif latest_z < -z_entry_thresh:
+                        side_label = f"LONG {name_a} / SHORT {name_b}"
                         st.session_state.arb_positions.append({
-                            "pair": selected_pair, "side": f"LONG {name_a} / SHORT {name_b}",
+                            "pair": selected_pair, "side": side_label,
                             "entry_z": latest_z, "entry_ratio": latest_ratio
                         })
+                        log_trade_to_db(time_now, side_label, price_a, 0.0, 0.0, 0.0, taker_fee_rate, "OPEN", abs(latest_z))
                         st.success(f"🚀 Stat-Arb Executed: Long {name_a} / Short {name_b} @ Z: {latest_z:+.2f}σ")
                     else:
-                        st.info("🔍 Monitoring Pair Ratio: Waiting for Mean Divergence (> |1.8σ|)...")
+                        st.info("🔍 Monitoring Pair Ratio: Waiting for Mean Divergence...")
 
                 if st.session_state.arb_positions:
                     active = st.session_state.arb_positions[0]
                     st.info(f"Active Position: **{active['side']}** | Entry Z: {active['entry_z']:+.2f}σ | Current Z: {latest_z:+.2f}σ")
                     if abs(latest_z) <= 0.2:
                         st.success("🎯 Mean Reversion Complete! Position Closed at Mean Spread.")
+                        log_trade_to_db(time_now, active['side'], price_a, price_a, 0.0, 0.0, taker_fee_rate, "CLOSED", abs(latest_z))
                         st.session_state.arb_positions.clear()
 
     trades_df = load_trade_history()
     if not trades_df.empty:
         st.markdown("---")
-        st.subheader("📜 Terminal Trade Execution Logs")
+        st.subheader("📜 Terminal Trade Execution Logs (Persistent Database)")
         st.dataframe(trades_df, use_container_width=True)
 
 render_active_strategy()
