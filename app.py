@@ -1,17 +1,24 @@
 import streamlit as st
 import sqlite3
-import psycopg2
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
 import os
 import lightgbm as lgb
 import requests
 
+# Dynamic import for PostgreSQL driver
+try:
+    import psycopg2
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
+
 # --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="Pro BTC Predictive & Stat-Arb Terminal",
+    page_title="Pro BTC Microstructure & ML Terminal",
     page_icon="⚡",
     layout="wide"
 )
@@ -21,7 +28,7 @@ LOCAL_DB_NAME = "btc_market_structure.db"
 
 # --- 2. PERSISTENT DATABASE CONNECTOR ---
 def get_db_connection():
-    if DB_URI:
+    if DB_URI and HAS_POSTGRES:
         uri = DB_URI.replace("postgres://", "postgresql://")
         return psycopg2.connect(uri), "pg"
     else:
@@ -40,7 +47,8 @@ def init_db():
                 micro_price DOUBLE PRECISION,
                 ofi DOUBLE PRECISION,
                 mlofi DOUBLE PRECISION,
-                cvd_acceleration DOUBLE PRECISION
+                cvd_acceleration DOUBLE PRECISION,
+                depth_imbalance DOUBLE PRECISION
             );
             CREATE TABLE IF NOT EXISTS pair_prices (
                 id SERIAL PRIMARY KEY,
@@ -67,7 +75,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS market_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
-                mid_price REAL, micro_price REAL, ofi REAL, mlofi REAL, cvd_acceleration REAL
+                mid_price REAL, micro_price REAL, ofi REAL, mlofi REAL, 
+                cvd_acceleration REAL, depth_imbalance REAL
             )
         ''')
         cursor.execute('''
@@ -89,8 +98,8 @@ def init_db():
 
 init_db()
 
-# --- 3. LIVE MULTI-ASSET FETCHING ENGINE ---
-def fetch_multi_asset_ticker():
+# --- 3. LIVE MULTI-ASSET & DEPTH FETCHING ENGINE ---
+def fetch_market_depth_and_prices():
     timestamp_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     symbols = {'BTCUSDT': None, 'ETHUSDT': None, 'SOLUSDT': None}
     
@@ -129,12 +138,13 @@ def fetch_multi_asset_ticker():
 
     micro = btc + np.random.normal(0, 0.2)
     ofi = np.random.normal(0, 0.3)
+    depth_imbalance = float(np.clip(np.random.normal(0.05, 0.25), -1.0, 1.0))
 
     ph = "%s" if db_type == "pg" else "?"
     cursor.execute(f'''
-        INSERT INTO market_data (timestamp, mid_price, micro_price, ofi, mlofi, cvd_acceleration)
-        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})
-    ''', (timestamp_str, btc, micro, ofi, ofi * 1.2, ofi * 0.8))
+        INSERT INTO market_data (timestamp, mid_price, micro_price, ofi, mlofi, cvd_acceleration, depth_imbalance)
+        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+    ''', (timestamp_str, btc, micro, ofi, ofi * 1.2, ofi * 0.8, depth_imbalance))
     
     cursor.execute(f'''
         INSERT INTO pair_prices (timestamp, btc_price, eth_price, sol_price)
@@ -159,20 +169,21 @@ def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, fricti
 def load_trade_history():
     try:
         conn, _ = get_db_connection()
-        df = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 100", conn)
+        df = pd.read_sql_query("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 50", conn)
         conn.close()
         return df
     except Exception:
         return pd.DataFrame()
 
-# --- 4. LIGHTGBM INFERENCE ENGINE ---
+# --- 4. ENHANCED LIGHTGBM INFERENCE ENGINE ---
 @st.cache_resource
 def load_or_init_lgbm():
-    X_dummy = np.random.randn(100, 6)
-    y_dummy = np.random.randint(0, 2, size=100)
+    # 8 Key Features: Micro Spread, MLOFI Z, CVD Z, EMA Diff, ATR, CVD Slope, Depth Imbalance, Realized Volatility
+    X_dummy = np.random.randn(200, 8)
+    y_dummy = np.random.randint(0, 2, size=200)
     train_data = lgb.Dataset(X_dummy, label=y_dummy)
     params = {'objective': 'binary', 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 15}
-    return lgb.train(params, train_data, num_boost_round=10)
+    return lgb.train(params, train_data, num_boost_round=15)
 
 lgb_model = load_or_init_lgbm()
 
@@ -188,8 +199,12 @@ if "arb_positions" not in st.session_state:
 
 st.sidebar.title("⚡ Quantitative Navigation")
 terminal_mode = st.sidebar.radio(
-    "Select Terminal Strategy",
-    ["Order Book Microstructure (Directional)", "Statistical Arbitrage (Market Neutral)"]
+    "Select Mode",
+    [
+        "Order Book Microstructure & ML", 
+        "Statistical Arbitrage (Market Neutral)",
+        "Correlation & Cross-Asset Heatmaps"
+    ]
 )
 
 st.sidebar.markdown("---")
@@ -197,7 +212,6 @@ st.sidebar.title("⚙️ Execution Settings")
 enable_paper_trader = st.sidebar.toggle("Enable Paper Trader", value=True)
 taker_fee_rate = st.sidebar.number_input("Taker Fee Rate (%)", value=0.05, step=0.01) / 100.0
 
-# Sidebar controls for Stat-Arb strategy (Placed outside fragment to avoid layout context errors)
 selected_pair = "BTC / ETH"
 z_entry_thresh = 1.8
 if terminal_mode == "Statistical Arbitrage (Market Neutral)":
@@ -206,9 +220,9 @@ if terminal_mode == "Statistical Arbitrage (Market Neutral)":
     selected_pair = st.sidebar.selectbox("Select Stat-Arb Pair", ["BTC / ETH", "BTC / SOL", "ETH / SOL"])
     z_entry_thresh = st.sidebar.slider("Stat-Arb Entry Threshold (σ)", 1.0, 3.0, 1.8, 0.1)
 
-# Connection status badge
+# Connection badge
 if DB_URI:
-    st.sidebar.success("☁️ Connected to Cloud Supabase Postgres")
+    st.sidebar.success("☁️ Connected to Supabase Postgres")
 else:
     st.sidebar.warning("⚠️ Using Local Temporary SQLite")
 
@@ -224,6 +238,8 @@ def load_directional_data():
         df = df.sort_values('timestamp').reset_index(drop=True)
         df['ema_100'] = df['mid_price'].ewm(span=20, adjust=False).mean()
         df['cvd_slope'] = df['cvd_acceleration'].rolling(window=5, min_periods=1).mean()
+        df['returns'] = df['mid_price'].pct_change().fillna(0.0)
+        df['realized_vol'] = df['returns'].rolling(window=10, min_periods=1).std().fillna(0.01) * 100.0
         df['high_low'] = df['mid_price'] - df['mid_price'].shift(1)
         df['atr'] = df['high_low'].abs().rolling(window=10, min_periods=1).mean().fillna(5.0)
         
@@ -249,14 +265,14 @@ def load_pair_data():
     except Exception:
         return pd.DataFrame()
 
-# --- 7. MAIN RENDER ENGINE WITH AUTOMATIC TICKING ---
-st.title("⚡ Pro Quant Predictive & Arbitrage Terminal")
+# --- 7. MAIN RENDER ENGINE WITH HEATMAPS ---
+st.title("⚡ Pro Quant Predictive & Analytics Terminal")
 
 @st.fragment(run_every=2)
 def render_active_strategy():
-    fetch_multi_asset_ticker()
+    fetch_market_depth_and_prices()
 
-    if terminal_mode == "Order Book Microstructure (Directional)":
+    if terminal_mode == "Order Book Microstructure & ML":
         df = load_directional_data()
         if not df.empty:
             latest = df.iloc[-1]
@@ -268,26 +284,68 @@ def render_active_strategy():
             current_ema = float(latest.get('ema_100', current_price))
             current_cvd_slope = float(latest.get('cvd_slope', 0.0))
             current_atr = max(float(latest.get('atr', 5.0)), 2.0)
+            depth_imb = float(latest.get('depth_imbalance', 0.0))
+            realized_vol = float(latest.get('realized_vol', 0.01))
 
             micro_spread = current_micro - current_price
             ema_diff = current_price - current_ema
-            feature_vector = [micro_spread, current_mlofi_z, current_cvd_z, ema_diff, current_atr, current_cvd_slope]
+            
+            # 8 Features sent directly to LightGBM AI
+            feature_vector = [
+                micro_spread, current_mlofi_z, current_cvd_z, 
+                ema_diff, current_atr, current_cvd_slope, 
+                depth_imb, realized_vol
+            ]
             ml_prob_long = predict_signal_probability(feature_vector)
 
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("BTC Mid Price", f"${current_price:,.2f}")
-            col2.metric("MLOFI Z-Score", f"{current_mlofi_z:+.2f} σ", delta=f"L1 OFI Z: {current_ofi_z:+.2f}σ")
-            col3.metric("Macro EMA", f"${current_ema:,.2f}")
-            col4.metric("Live ATR Volatility", f"${current_atr:,.2f}")
+            col2.metric("MLOFI Z-Score", f"{current_mlofi_z:+.2f} σ")
+            col3.metric("Depth Imbalance", f"{depth_imb:+.2%}")
+            col4.metric("Realized Volatility", f"{realized_vol:.3f}%")
             col5.metric("ML Long Prob.", f"{ml_prob_long:.2%}")
 
-            st.subheader("📈 Microstructure & Trend Regime Chart")
+            st.subheader("📈 Price Action & Trend Microstructure")
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df['timestamp'], y=df['mid_price'], name="Mid Price", line=dict(color="#00FFA3", width=2.5)))
-            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['micro_price'], name="Micro-Price", line=dict(color="#FF007A", width=1.5, dash='dash')))
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['micro_price'], name="Micro Price", line=dict(color="#FF007A", width=1.5, dash='dash')))
             fig.add_trace(go.Scatter(x=df['timestamp'], y=df['ema_100'], name="EMA Trend", line=dict(color="#00E5FF", width=1.5, dash='dot')))
-            fig.update_layout(template="plotly_dark", height=380, margin=dict(l=10, r=10, t=30, b=10))
+            fig.update_layout(template="plotly_dark", height=350, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
+
+            # 🔥 NEW: ORDER BOOK DEPTH HEATMAP
+            st.subheader("🔥 Order Book Liquidity Density Heatmap (Depth Distribution)")
+            price_levels = np.linspace(current_price - 20, current_price + 20, 10)
+            time_steps = df['timestamp'].dt.strftime('%H:%M:%S').tail(20).tolist()
+            
+            # Generate simulated order book liquidity grid based on depth_imbalance
+            density_matrix = []
+            for lvl in price_levels:
+                row = []
+                for imb in df['depth_imbalance'].tail(20):
+                    distance = abs(lvl - current_price)
+                    base_liquidity = max(0.1, 10.0 - distance * 0.4)
+                    if lvl > current_price: # Ask side
+                        liquidity = base_liquidity * (1.0 - imb)
+                    else: # Bid side
+                        liquidity = base_liquidity * (1.0 + imb)
+                    row.append(liquidity)
+                density_matrix.append(row)
+
+            heatmap_fig = go.Figure(data=go.Heatmap(
+                z=density_matrix,
+                x=time_steps,
+                y=price_levels,
+                colorscale="Viridis"
+            ))
+            heatmap_fig.update_layout(
+                template="plotly_dark", 
+                height=320, 
+                yaxis_title="Price Tiers ($)", 
+                xaxis_title="Time Step",
+                margin=dict(l=10, r=10, t=20, b=10)
+            )
+            st.plotly_chart(heatmap_fig, use_container_width=True)
 
     elif terminal_mode == "Statistical Arbitrage (Market Neutral)":
         pair_df = load_pair_data()
@@ -316,7 +374,7 @@ def render_active_strategy():
             col1.metric(f"Price {name_a}", f"${price_a:,.2f}")
             col2.metric(f"Price {name_b}", f"${price_b:,.2f}")
             col3.metric("Pair Price Ratio", f"{latest_ratio:.4f}")
-            col4.metric("Spread Z-Score", f"{latest_z:+.2f} σ", delta="Mean Reversion Mode")
+            col4.metric("Spread Z-Score", f"{latest_z:+.2f} σ")
 
             st.subheader(f"📊 Statistical Spread & Z-Score Analysis ({selected_pair})")
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.6, 0.4])
@@ -331,44 +389,31 @@ def render_active_strategy():
             fig.update_layout(template="plotly_dark", height=420, margin=dict(l=10, r=10, t=20, b=10))
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown("---")
-            st.subheader("⚖️ Market-Neutral Arbitrage Execution Engine")
+    elif terminal_mode == "Correlation & Cross-Asset Heatmaps":
+        pair_df = load_pair_data()
+        if not pair_df.empty and len(pair_df) > 5:
+            st.subheader("🔥 Cross-Asset Rolling Price Correlation Matrix")
             
-            if enable_paper_trader:
-                time_now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-                if not st.session_state.arb_positions:
-                    if latest_z > z_entry_thresh:
-                        side_label = f"SHORT {name_a} / LONG {name_b}"
-                        st.session_state.arb_positions.append({
-                            "pair": selected_pair, "side": side_label,
-                            "entry_z": latest_z, "entry_ratio": latest_ratio
-                        })
-                        log_trade_to_db(time_now, side_label, price_a, 0.0, 0.0, 0.0, taker_fee_rate, "OPEN", abs(latest_z))
-                        st.warning(f"🚨 Stat-Arb Executed: Short {name_a} / Long {name_b} @ Z: {latest_z:+.2f}σ")
+            corr_df = pair_df[['btc_price', 'eth_price', 'sol_price']].rename(
+                columns={'btc_price': 'BTC', 'eth_price': 'ETH', 'sol_price': 'SOL'}
+            ).corr()
 
-                    elif latest_z < -z_entry_thresh:
-                        side_label = f"LONG {name_a} / SHORT {name_b}"
-                        st.session_state.arb_positions.append({
-                            "pair": selected_pair, "side": side_label,
-                            "entry_z": latest_z, "entry_ratio": latest_ratio
-                        })
-                        log_trade_to_db(time_now, side_label, price_a, 0.0, 0.0, 0.0, taker_fee_rate, "OPEN", abs(latest_z))
-                        st.success(f"🚀 Stat-Arb Executed: Long {name_a} / Short {name_b} @ Z: {latest_z:+.2f}σ")
-                    else:
-                        st.info("🔍 Monitoring Pair Ratio: Waiting for Mean Divergence...")
+            corr_fig = px.imshow(
+                corr_df,
+                text_auto=".3f",
+                color_continuous_scale="Plasma",
+                title="Real-Time Cross-Asset Pearson Correlation"
+            )
+            corr_fig.update_layout(template="plotly_dark", height=450)
+            st.plotly_chart(corr_fig, use_container_width=True)
 
-                if st.session_state.arb_positions:
-                    active = st.session_state.arb_positions[0]
-                    st.info(f"Active Position: **{active['side']}** | Entry Z: {active['entry_z']:+.2f}σ | Current Z: {latest_z:+.2f}σ")
-                    if abs(latest_z) <= 0.2:
-                        st.success("🎯 Mean Reversion Complete! Position Closed at Mean Spread.")
-                        log_trade_to_db(time_now, active['side'], price_a, price_a, 0.0, 0.0, taker_fee_rate, "CLOSED", abs(latest_z))
-                        st.session_state.arb_positions.clear()
+            st.info("💡 **Quant Insight:** High cross-asset correlation (>0.85) indicates macro-driven trend momentum. Correlation decoupling (<0.50) presents prime statistical arbitrage mean-reversion opportunities.")
 
+    # Always log active persistence table
     trades_df = load_trade_history()
     if not trades_df.empty:
         st.markdown("---")
-        st.subheader("📜 Terminal Trade Execution Logs (Persistent Database)")
+        st.subheader("📜 Terminal Trade Execution Logs (Persistent Supabase Database)")
         st.dataframe(trades_df, use_container_width=True)
 
 render_active_strategy()
