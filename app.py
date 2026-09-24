@@ -15,6 +15,7 @@ try:
 except ImportError:
     HAS_POSTGRES = False
 
+# --- 1. PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="Pro BTC Microstructure & ML Terminal",
     page_icon="⚡",
@@ -24,6 +25,7 @@ st.set_page_config(
 DB_URI = os.getenv("DATABASE_URL")
 LOCAL_DB_NAME = "btc_market_structure.db"
 
+# --- 2. PERSISTENT DATABASE CONNECTOR ---
 def get_db_connection():
     if DB_URI and HAS_POSTGRES:
         uri = DB_URI.replace("postgres://", "postgresql://")
@@ -94,6 +96,7 @@ def init_db():
 
 init_db()
 
+# --- 3. DATA FETCHING ENGINE ---
 def fetch_market_depth_and_prices():
     timestamp_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     symbols = {'BTCUSDT': None, 'ETHUSDT': None, 'SOLUSDT': None}
@@ -149,10 +152,9 @@ def fetch_market_depth_and_prices():
     conn.commit()
     conn.close()
 
-# --- DYNAMIC SUPABASE-TRAINED ML ENGINE ---
+# --- 4. DYNAMIC SUPABASE-TRAINED ML ENGINE ---
 def train_and_predict_lgbm(features_df, latest_features):
     if len(features_df) < 20:
-        # Fallback to cold-start dummy training if table is still building history
         X_dummy = np.random.randn(100, len(latest_features))
         y_dummy = np.random.randint(0, 2, size=100)
         train_data = lgb.Dataset(X_dummy, label=y_dummy)
@@ -160,7 +162,6 @@ def train_and_predict_lgbm(features_df, latest_features):
         model = lgb.train(params, train_data, num_boost_round=10)
         return float(model.predict(np.array(latest_features).reshape(1, -1))[0])
 
-    # Build target variable: Did mid_price go UP in the next 3 ticks?
     features_df['target'] = (features_df['mid_price'].shift(-3) > features_df['mid_price']).astype(int)
     
     feature_cols = [
@@ -183,6 +184,19 @@ def train_and_predict_lgbm(features_df, latest_features):
     prediction = model.predict(np.array(latest_features).reshape(1, -1))[0]
     return float(prediction)
 
+# --- 5. DB TRADE LOGGING ENGINE ---
+def log_trade_to_db(timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
+    conn, db_type = get_db_connection()
+    cursor = conn.cursor()
+    ph = "%s" if db_type == "pg" else "?"
+    cursor.execute(f'''
+        INSERT INTO paper_trades 
+        (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence)
+        VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+    ''', (timestamp, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence))
+    conn.commit()
+    conn.close()
+
 def load_trade_history():
     try:
         conn, _ = get_db_connection()
@@ -192,7 +206,7 @@ def load_trade_history():
     except Exception:
         return pd.DataFrame()
 
-# --- NAVIGATION SIDEBAR ---
+# --- 6. SIDEBAR CONTROLS ---
 st.sidebar.title("⚡ Quantitative Navigation")
 terminal_mode = st.sidebar.radio(
     "Select Mode",
@@ -204,11 +218,22 @@ terminal_mode = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.title("⚙️ Autonomous Execution")
+enable_paper_trader = st.sidebar.toggle("Enable Paper Trader", value=True)
+taker_fee_rate = st.sidebar.number_input("Taker Fee Rate (%)", value=0.05, step=0.01) / 100.0
+position_size = st.sidebar.number_input("Trade Size (BTC)", value=0.1, step=0.01)
+
+st.sidebar.markdown("---")
 if DB_URI:
     st.sidebar.success("☁️ Connected to Supabase Postgres")
 else:
     st.sidebar.warning("⚠️ Using Local Temporary SQLite")
 
+# --- 7. SESSION STATE FOR POSITIONS ---
+if "active_position" not in st.session_state:
+    st.session_state.active_position = None
+
+# --- 8. LOAD DATA ---
 def load_directional_data():
     try:
         conn, _ = get_db_connection()
@@ -249,6 +274,7 @@ def load_pair_data():
     except Exception:
         return pd.DataFrame()
 
+# --- 9. MAIN DASHBOARD ---
 st.title("⚡ Pro Quant Predictive & Analytics Terminal")
 
 @st.fragment(run_every=2)
@@ -278,15 +304,76 @@ def render_active_strategy():
                 depth_imb, realized_vol
             ]
             
-            # Predict probability dynamically trained on Supabase database history
             ml_prob_long = train_and_predict_lgbm(df, latest_features)
 
+            # --- AUTONOMOUS TRADER EXECUTION LOGIC ---
+            timestamp_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if enable_paper_trader:
+                active = st.session_state.active_position
+                if active is None:
+                    # Entry condition: ML Probability > 60% or < 40%
+                    if ml_prob_long > 0.60:
+                        st.session_state.active_position = {
+                            "side": "LONG",
+                            "entry_price": current_price,
+                            "confidence": ml_prob_long,
+                            "timestamp": timestamp_str
+                        }
+                    elif ml_prob_long < 0.40:
+                        st.session_state.active_position = {
+                            "side": "SHORT",
+                            "entry_price": current_price,
+                            "confidence": ml_prob_long,
+                            "timestamp": timestamp_str
+                        }
+                else:
+                    # Exit condition: Take profit / Stop loss or signal reversal
+                    entry_p = active["entry_price"]
+                    side = active["side"]
+                    
+                    price_diff = (current_price - entry_p) if side == "LONG" else (entry_p - current_price)
+                    gross_pnl = price_diff * position_size
+                    fees = (entry_p + current_price) * position_size * taker_fee_rate
+                    net_pnl = gross_pnl - fees
+
+                    # Close position if PnL reaches threshold or signal flips
+                    should_close = False
+                    if abs(price_diff) >= (current_atr * 1.2):
+                        should_close = True
+                    elif side == "LONG" and ml_prob_long < 0.45:
+                        should_close = True
+                    elif side == "SHORT" and ml_prob_long > 0.55:
+                        should_close = True
+
+                    if should_close:
+                        log_trade_to_db(
+                            timestamp=timestamp_str,
+                            side=side,
+                            entry_p=entry_p,
+                            exit_p=current_price,
+                            gross_pnl=gross_pnl,
+                            net_pnl=net_pnl,
+                            friction=fees,
+                            status="CLOSED",
+                            confidence=active["confidence"]
+                        )
+                        st.session_state.active_position = None
+
+            # Render Top Indicators
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("BTC Mid Price", f"${current_price:,.2f}")
             col2.metric("MLOFI Z-Score", f"{current_mlofi_z:+.2f} σ")
             col3.metric("Depth Imbalance", f"{depth_imb:+.2%}")
             col4.metric("Realized Volatility", f"{realized_vol:.3f}%")
-            col5.metric("AI Long Prob (Supabase Fitted)", f"{ml_prob_long:.2%}")
+            col5.metric("AI Long Prob", f"{ml_prob_long:.2%}")
+
+            # Show active position if open
+            if st.session_state.active_position:
+                pos = st.session_state.active_position
+                p_diff = (current_price - pos['entry_price']) if pos['side'] == "LONG" else (pos['entry_price'] - current_price)
+                unrealized_pnl = p_diff * position_size
+                st.info(f"🟢 **ACTIVE {pos['side']} POSITION OPEN** | Entry: ${pos['entry_price']:,.2f} | Current PnL: **${unrealized_pnl:+.2f}**")
 
             st.subheader("📈 Price Action & Trend Microstructure")
             fig = go.Figure()
@@ -377,10 +464,25 @@ def render_active_strategy():
             corr_fig.update_layout(template="plotly_dark", height=450)
             st.plotly_chart(corr_fig, use_container_width=True)
 
+    # --- 10. TRADES & WIN-RATE ANALYTICS BOARD ---
     trades_df = load_trade_history()
+    st.markdown("---")
+    st.subheader("📜 Terminal Execution Logs & Performance Metrics")
+    
     if not trades_df.empty:
-        st.markdown("---")
-        st.subheader("📜 Terminal Trade Execution Logs (Persistent Supabase Database)")
+        total_trades = len(trades_df)
+        winning_trades = len(trades_df[trades_df['net_pnl'] > 0])
+        win_rate = (winning_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
+        total_net_pnl = trades_df['net_pnl'].sum()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Executed Trades", f"{total_trades}")
+        m2.metric("Win Rate (%)", f"{win_rate:.1f}%")
+        m3.metric("Net Cumulative PnL", f"${total_net_pnl:+.2f}")
+        m4.metric("Total Fees Paid", f"${trades_df['fee_slippage'].sum():.2f}")
+
         st.dataframe(trades_df, use_container_width=True)
+    else:
+        st.info("⌛ Autonomous Trader active. Waiting for ML signals to trigger and close paper positions...")
 
 render_active_strategy()
