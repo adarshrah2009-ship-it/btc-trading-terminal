@@ -129,7 +129,7 @@ def fetch_market_depth_and_prices():
     if btc is None or eth is None or sol is None:
         cursor.execute("SELECT btc_price, eth_price, sol_price FROM pair_prices ORDER BY id DESC LIMIT 1")
         last_row = cursor.fetchone()
-        btc = last_row[0] + np.random.normal(0, 1.5) if last_row else 80450.0
+        btc = last_row[0] + np.random.normal(0, 1.5) if last_row else 84100.0
         eth = last_row[1] + np.random.normal(0, 0.2) if last_row else 2650.0
         sol = last_row[2] + np.random.normal(0, 0.05) if last_row else 145.0
 
@@ -151,7 +151,7 @@ def fetch_market_depth_and_prices():
     conn.commit()
     conn.close()
 
-# --- OPTIMIZED CACHED MODEL ENGINE ---
+# --- CACHED MODEL ENGINE ---
 if "trained_lgbm_model" not in st.session_state:
     st.session_state.trained_lgbm_model = None
 if "last_train_time" not in st.session_state:
@@ -159,7 +159,7 @@ if "last_train_time" not in st.session_state:
 
 def get_or_train_lgbm(features_df):
     current_time = time.time()
-    # Retrain model only once every 120 seconds (2 minutes) to keep execution instant
+    # Retrain model once every 120 seconds (2 mins) to keep app execution instant
     if st.session_state.trained_lgbm_model is not None and (current_time - st.session_state.last_train_time) < 120:
         return st.session_state.trained_lgbm_model
 
@@ -179,7 +179,7 @@ def get_or_train_lgbm(features_df):
             st.session_state.last_train_time = current_time
             return model
 
-    # Fallback fast dummy initialization
+    # Fallback initialization
     X_dummy = np.random.randn(50, len(feature_cols))
     y_dummy = np.random.randint(0, 2, size=50)
     train_data = lgb.Dataset(X_dummy, label=y_dummy)
@@ -216,7 +216,7 @@ def load_trade_history():
     except Exception:
         return pd.DataFrame()
 
-# Navigation & Execution Controls
+# Navigation & Global Execution Controls
 st.sidebar.title("⚡ Quantitative Navigation")
 terminal_mode = st.sidebar.radio(
     "Select Mode",
@@ -247,7 +247,6 @@ if "active_arb_position" not in st.session_state:
 def load_directional_data():
     try:
         conn, _ = get_db_connection()
-        # Query only the last 100 rows to keep memory footprint light and quick
         df = pd.read_sql_query("SELECT * FROM market_data ORDER BY id DESC LIMIT 100", conn)
         conn.close()
         if df.empty:
@@ -299,7 +298,7 @@ def render_active_strategy():
     current_price = 0.0
     current_atr = 5.0
 
-    # --- GLOBAL FAST AUTOTRADER ENGINE ---
+    # --- 1. OPTIMIZED ML STRATEGY EXECUTION ENGINE ---
     if not df.empty:
         latest = df.iloc[-1]
         current_price = float(latest.get('mid_price', 0.0))
@@ -321,18 +320,29 @@ def render_active_strategy():
             depth_imb, realized_vol
         ]
         
-        # Get cached model & make instant prediction
+        # Instant cached prediction
         lgb_model = get_or_train_lgbm(df)
         ml_prob_long = predict_lgbm(lgb_model, latest_features)
 
-        # 1. ML Strategy Engine
         if enable_paper_trader:
             ml_pos = st.session_state.active_ml_position
+            
+            # Entry logic with stricter confidence threshold (Avoid random noise)
             if ml_pos is None:
-                if ml_prob_long > 0.60:
-                    st.session_state.active_ml_position = {"side": "LONG", "entry_price": current_price, "confidence": ml_prob_long}
-                elif ml_prob_long < 0.40:
-                    st.session_state.active_ml_position = {"side": "SHORT", "entry_price": current_price, "confidence": ml_prob_long}
+                if ml_prob_long >= 0.68:
+                    st.session_state.active_ml_position = {
+                        "side": "LONG", 
+                        "entry_price": current_price, 
+                        "confidence": ml_prob_long
+                    }
+                elif ml_prob_long <= 0.32:
+                    st.session_state.active_ml_position = {
+                        "side": "SHORT", 
+                        "entry_price": current_price, 
+                        "confidence": ml_prob_long
+                    }
+            
+            # Exit logic (Outrun $8.41 fee drag with wider profit target)
             else:
                 entry_p = ml_pos["entry_price"]
                 side = ml_pos["side"]
@@ -341,11 +351,18 @@ def render_active_strategy():
                 fees = (entry_p + current_price) * position_size * taker_fee_rate
                 net_pnl = gross_pnl - fees
 
-                if abs(price_diff) >= (current_atr * 1.2) or (side == "LONG" and ml_prob_long < 0.45) or (side == "SHORT" and ml_prob_long > 0.55):
-                    log_trade_to_db(timestamp_str, "ML_Microstructure", side, entry_p, current_price, gross_pnl, net_pnl, fees, "CLOSED", ml_pos["confidence"])
+                min_tp = current_atr * 2.5   # Take profit room (~$20+ price move)
+                max_sl = current_atr * 1.5   # Risk boundary
+                signal_reversed = (side == "LONG" and ml_prob_long < 0.40) or (side == "SHORT" and ml_prob_long > 0.60)
+
+                if price_diff >= min_tp or price_diff <= -max_sl or signal_reversed:
+                    log_trade_to_db(
+                        timestamp_str, "ML_Microstructure", side, entry_p, 
+                        current_price, gross_pnl, net_pnl, fees, "CLOSED", ml_pos["confidence"]
+                    )
                     st.session_state.active_ml_position = None
 
-    # 2. Stat-Arb Strategy Engine
+    # --- 2. STAT-ARB STRATEGY ENGINE ---
     if not pair_df.empty and len(pair_df) > 5:
         pair_df['ratio'] = pair_df['btc_price'] / pair_df['eth_price']
         pair_df['ratio_mean'] = pair_df['ratio'].rolling(window=15, min_periods=1).mean()
@@ -374,7 +391,7 @@ def render_active_strategy():
                     log_trade_to_db(timestamp_str, "Stat_Arb_Pairs", side, entry_r, latest_ratio, gross_pnl, net_pnl, fees, "CLOSED", arb_pos["confidence"])
                     st.session_state.active_arb_position = None
 
-    # UI RENDERING
+    # --- UI RENDERING ---
     if terminal_mode == "Order Book Microstructure & ML":
         if not df.empty:
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -439,7 +456,7 @@ def render_active_strategy():
             corr_fig.update_layout(template="plotly_dark", height=450)
             st.plotly_chart(corr_fig, use_container_width=True)
 
-    # TRADES & PERFORMANCE TABLE
+    # --- PERFORMANCE METRICS & HISTORY ---
     trades_df = load_trade_history()
     st.markdown("---")
     st.subheader("📜 Terminal Execution Logs & Performance Metrics (All Strategies)")
