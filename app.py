@@ -8,6 +8,7 @@ from plotly.subplots import make_subplots
 import os
 import lightgbm as lgb
 import requests
+import time
 
 try:
     import psycopg2
@@ -34,7 +35,6 @@ def get_db_connection():
 def init_db():
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
-    
     if db_type == "pg":
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS market_data (
@@ -107,7 +107,7 @@ def fetch_market_depth_and_prices():
     
     for url in endpoints:
         try:
-            res = requests.get(url, timeout=1.5).json()
+            res = requests.get(url, timeout=1.0).json()
             if isinstance(res, list):
                 for item in res:
                     if item.get('symbol') in symbols:
@@ -151,35 +151,49 @@ def fetch_market_depth_and_prices():
     conn.commit()
     conn.close()
 
-def train_and_predict_lgbm(features_df, latest_features):
-    if len(features_df) < 20:
-        X_dummy = np.random.randn(100, len(latest_features))
-        y_dummy = np.random.randint(0, 2, size=100)
-        train_data = lgb.Dataset(X_dummy, label=y_dummy)
-        params = {'objective': 'binary', 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 15}
-        model = lgb.train(params, train_data, num_boost_round=10)
-        return float(model.predict(np.array(latest_features).reshape(1, -1))[0])
+# --- OPTIMIZED CACHED MODEL ENGINE ---
+if "trained_lgbm_model" not in st.session_state:
+    st.session_state.trained_lgbm_model = None
+if "last_train_time" not in st.session_state:
+    st.session_state.last_train_time = 0
 
-    features_df['target'] = (features_df['mid_price'].shift(-3) > features_df['mid_price']).astype(int)
+def get_or_train_lgbm(features_df):
+    current_time = time.time()
+    # Retrain model only once every 120 seconds (2 minutes) to keep execution instant
+    if st.session_state.trained_lgbm_model is not None and (current_time - st.session_state.last_train_time) < 120:
+        return st.session_state.trained_lgbm_model
+
+    feature_cols = ['micro_spread', 'mlofi_z', 'cvd_acceleration_z', 'ema_diff', 'atr', 'cvd_slope', 'depth_imbalance', 'realized_vol']
     
-    feature_cols = [
-        'micro_spread', 'mlofi_z', 'cvd_acceleration_z', 
-        'ema_diff', 'atr', 'cvd_slope', 'depth_imbalance', 'realized_vol'
-    ]
-    
-    clean_df = features_df.dropna(subset=feature_cols + ['target'])
-    if len(clean_df) < 15:
-        return 0.50
+    if len(features_df) >= 20:
+        features_df = features_df.copy()
+        features_df['target'] = (features_df['mid_price'].shift(-3) > features_df['mid_price']).astype(int)
+        clean_df = features_df.dropna(subset=feature_cols + ['target'])
+        if len(clean_df) >= 15:
+            X = clean_df[feature_cols].values
+            y = clean_df['target'].values
+            train_data = lgb.Dataset(X, label=y)
+            params = {'objective': 'binary', 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 15}
+            model = lgb.train(params, train_data, num_boost_round=25)
+            st.session_state.trained_lgbm_model = model
+            st.session_state.last_train_time = current_time
+            return model
 
-    X = clean_df[feature_cols].values
-    y = clean_df['target'].values
-
-    train_data = lgb.Dataset(X, label=y)
+    # Fallback fast dummy initialization
+    X_dummy = np.random.randn(50, len(feature_cols))
+    y_dummy = np.random.randint(0, 2, size=50)
+    train_data = lgb.Dataset(X_dummy, label=y_dummy)
     params = {'objective': 'binary', 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 15}
-    model = lgb.train(params, train_data, num_boost_round=25)
+    model = lgb.train(params, train_data, num_boost_round=10)
+    st.session_state.trained_lgbm_model = model
+    st.session_state.last_train_time = current_time
+    return model
 
-    prediction = model.predict(np.array(latest_features).reshape(1, -1))[0]
-    return float(prediction)
+def predict_lgbm(model, latest_features):
+    try:
+        return float(model.predict(np.array(latest_features).reshape(1, -1))[0])
+    except Exception:
+        return 0.50
 
 def log_trade_to_db(timestamp, strategy, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
     conn, db_type = get_db_connection()
@@ -233,7 +247,8 @@ if "active_arb_position" not in st.session_state:
 def load_directional_data():
     try:
         conn, _ = get_db_connection()
-        df = pd.read_sql_query("SELECT * FROM market_data ORDER BY id DESC LIMIT 150", conn)
+        # Query only the last 100 rows to keep memory footprint light and quick
+        df = pd.read_sql_query("SELECT * FROM market_data ORDER BY id DESC LIMIT 100", conn)
         conn.close()
         if df.empty:
             return pd.DataFrame()
@@ -261,7 +276,7 @@ def load_directional_data():
 def load_pair_data():
     try:
         conn, _ = get_db_connection()
-        df = pd.read_sql_query("SELECT * FROM pair_prices ORDER BY id DESC LIMIT 100", conn)
+        df = pd.read_sql_query("SELECT * FROM pair_prices ORDER BY id DESC LIMIT 80", conn)
         conn.close()
         if df.empty:
             return pd.DataFrame()
@@ -284,7 +299,7 @@ def render_active_strategy():
     current_price = 0.0
     current_atr = 5.0
 
-    # --- GLOBAL MULTI-STRATEGY AUTOTRADER ENGINE ---
+    # --- GLOBAL FAST AUTOTRADER ENGINE ---
     if not df.empty:
         latest = df.iloc[-1]
         current_price = float(latest.get('mid_price', 0.0))
@@ -306,7 +321,9 @@ def render_active_strategy():
             depth_imb, realized_vol
         ]
         
-        ml_prob_long = train_and_predict_lgbm(df, latest_features)
+        # Get cached model & make instant prediction
+        lgb_model = get_or_train_lgbm(df)
+        ml_prob_long = predict_lgbm(lgb_model, latest_features)
 
         # 1. ML Strategy Engine
         if enable_paper_trader:
@@ -341,9 +358,9 @@ def render_active_strategy():
         if enable_paper_trader:
             arb_pos = st.session_state.active_arb_position
             if arb_pos is None:
-                if latest_z > 1.8: # Short Ratio
+                if latest_z > 1.8:
                     st.session_state.active_arb_position = {"side": "SHORT_RATIO", "entry_ratio": latest_ratio, "confidence": abs(latest_z)}
-                elif latest_z < -1.8: # Long Ratio
+                elif latest_z < -1.8:
                     st.session_state.active_arb_position = {"side": "LONG_RATIO", "entry_ratio": latest_ratio, "confidence": abs(latest_z)}
             else:
                 entry_r = arb_pos["entry_ratio"]
@@ -353,11 +370,11 @@ def render_active_strategy():
                 fees = 2.0
                 net_pnl = gross_pnl - fees
 
-                if abs(latest_z) < 0.2: # Reverted to mean
+                if abs(latest_z) < 0.2:
                     log_trade_to_db(timestamp_str, "Stat_Arb_Pairs", side, entry_r, latest_ratio, gross_pnl, net_pnl, fees, "CLOSED", arb_pos["confidence"])
                     st.session_state.active_arb_position = None
 
-    # --- UI RENDER BY SELECTED TAB ---
+    # UI RENDERING
     if terminal_mode == "Order Book Microstructure & ML":
         if not df.empty:
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -422,7 +439,7 @@ def render_active_strategy():
             corr_fig.update_layout(template="plotly_dark", height=450)
             st.plotly_chart(corr_fig, use_container_width=True)
 
-    # --- SHARED GLOBAL TRADES & WIN-RATE ANALYTICS BOARD ---
+    # TRADES & PERFORMANCE TABLE
     trades_df = load_trade_history()
     st.markdown("---")
     st.subheader("📜 Terminal Execution Logs & Performance Metrics (All Strategies)")
