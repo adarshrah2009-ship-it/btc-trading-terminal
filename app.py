@@ -159,7 +159,6 @@ if "last_train_time" not in st.session_state:
 
 def get_or_train_lgbm(features_df):
     current_time = time.time()
-    # Retrain model once every 120 seconds (2 mins) to keep app execution instant
     if st.session_state.trained_lgbm_model is not None and (current_time - st.session_state.last_train_time) < 120:
         return st.session_state.trained_lgbm_model
 
@@ -179,7 +178,6 @@ def get_or_train_lgbm(features_df):
             st.session_state.last_train_time = current_time
             return model
 
-    # Fallback initialization
     X_dummy = np.random.randn(50, len(feature_cols))
     y_dummy = np.random.randint(0, 2, size=50)
     train_data = lgb.Dataset(X_dummy, label=y_dummy)
@@ -194,6 +192,25 @@ def predict_lgbm(model, latest_features):
         return float(model.predict(np.array(latest_features).reshape(1, -1))[0])
     except Exception:
         return 0.50
+
+def calculate_liquidation_sweep_risk(df, current_price):
+    if len(df) < 15:
+        return 0.0, "NO_SWEEP"
+    
+    cvd_z = df['cvd_acceleration_z'].iloc[-1] if 'cvd_acceleration_z' in df.columns else 0.0
+    depth_imb = df['depth_imbalance'].iloc[-1] if 'depth_imbalance' in df.columns else 0.0
+    
+    # Magnet Score combines Order Book Imbalance & Cumulative Volume Delta
+    magnet_score = (depth_imb * 0.6) + (np.tanh(cvd_z) * 0.4)
+    
+    if magnet_score > 0.45:
+        sweep_bias = "SWEEP_DOWN_FIRST"  # Market hunting long liquidations below
+    elif magnet_score < -0.45:
+        sweep_bias = "SWEEP_UP_FIRST"    # Market hunting short liquidations above
+    else:
+        sweep_bias = "NO_SWEEP"
+        
+    return magnet_score, sweep_bias
 
 def log_trade_to_db(timestamp, strategy, side, entry_p, exit_p, gross_pnl, net_pnl, friction, status, confidence):
     conn, db_type = get_db_connection()
@@ -216,7 +233,7 @@ def load_trade_history():
     except Exception:
         return pd.DataFrame()
 
-# Navigation & Global Execution Controls
+# Navigation & Global Controls
 st.sidebar.title("⚡ Quantitative Navigation")
 terminal_mode = st.sidebar.radio(
     "Select Mode",
@@ -297,8 +314,9 @@ def render_active_strategy():
     ml_prob_long = 0.50
     current_price = 0.0
     current_atr = 5.0
+    sweep_bias = "NO_SWEEP"
 
-    # --- 1. OPTIMIZED ML STRATEGY EXECUTION ENGINE ---
+    # --- 1. PSYCHOLOGY & ML STRATEGY EXECUTION ENGINE ---
     if not df.empty:
         latest = df.iloc[-1]
         current_price = float(latest.get('mid_price', 0.0))
@@ -320,29 +338,31 @@ def render_active_strategy():
             depth_imb, realized_vol
         ]
         
-        # Instant cached prediction
         lgb_model = get_or_train_lgbm(df)
         ml_prob_long = predict_lgbm(lgb_model, latest_features)
+        
+        # Calculate Liquidation Magnet & Sweep Hazard
+        magnet_score, sweep_bias = calculate_liquidation_sweep_risk(df, current_price)
 
         if enable_paper_trader:
             ml_pos = st.session_state.active_ml_position
             
-            # Entry logic with stricter confidence threshold (Avoid random noise)
+            # Entry logic: Must satisfy strict confidence AND pass Liquidation Sweep Filter
             if ml_pos is None:
-                if ml_prob_long >= 0.68:
+                if ml_prob_long >= 0.68 and sweep_bias != "SWEEP_DOWN_FIRST":
                     st.session_state.active_ml_position = {
                         "side": "LONG", 
                         "entry_price": current_price, 
                         "confidence": ml_prob_long
                     }
-                elif ml_prob_long <= 0.32:
+                elif ml_prob_long <= 0.32 and sweep_bias != "SWEEP_UP_FIRST":
                     st.session_state.active_ml_position = {
                         "side": "SHORT", 
                         "entry_price": current_price, 
                         "confidence": ml_prob_long
                     }
             
-            # Exit logic (Outrun $8.41 fee drag with wider profit target)
+            # Exit logic: Minimum 2.5x ATR Take-Profit to beat fee drag
             else:
                 entry_p = ml_pos["entry_price"]
                 side = ml_pos["side"]
@@ -351,7 +371,7 @@ def render_active_strategy():
                 fees = (entry_p + current_price) * position_size * taker_fee_rate
                 net_pnl = gross_pnl - fees
 
-                min_tp = current_atr * 2.5   # Take profit room (~$20+ price move)
+                min_tp = current_atr * 2.5   # Enforces min ~$200 price move (~$20.00 gross) to beat $8.41 fee drag
                 max_sl = current_atr * 1.5   # Risk boundary
                 signal_reversed = (side == "LONG" and ml_prob_long < 0.40) or (side == "SHORT" and ml_prob_long > 0.60)
 
@@ -397,14 +417,14 @@ def render_active_strategy():
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("BTC Mid Price", f"${current_price:,.2f}")
             col2.metric("MLOFI Z-Score", f"{latest.get('mlofi_z', 0.0):+.2f} σ")
-            col3.metric("Depth Imbalance", f"{latest.get('depth_imbalance', 0.0):+.2%}")
+            col3.metric("Liquidation Hazard", f"{sweep_bias}")
             col4.metric("Realized Volatility", f"{latest.get('realized_vol', 0.01):.3f}%")
             col5.metric("AI Long Prob", f"{ml_prob_long:.2%}")
 
             if st.session_state.active_ml_position:
                 pos = st.session_state.active_ml_position
                 p_diff = (current_price - pos['entry_price']) if pos['side'] == "LONG" else (pos['entry_price'] - current_price)
-                st.info(f"🟢 **ACTIVE ML {pos['side']} POSITION** | Entry: ${pos['entry_price']:,.2f} | Current PnL: **${p_diff * position_size:+.2f}**")
+                st.info(f"🟢 **ACTIVE ML {pos['side']} POSITION** | Entry: ${pos['entry_price']:,.2f} | Current Gross PnL: **${p_diff * position_size:+.2f}**")
 
             st.subheader("📈 Price Action & Trend Microstructure")
             fig = go.Figure()
@@ -475,6 +495,6 @@ def render_active_strategy():
 
         st.dataframe(trades_df, use_container_width=True)
     else:
-        st.info("⌛ Autonomous Multi-Strategy Engine active. Listening for ML signals & Statistical Spreads...")
+        st.info("⌛ Autonomous Multi-Strategy Engine active. Listening for ML signals & Liquidation Spreads...")
 
 render_active_strategy()
