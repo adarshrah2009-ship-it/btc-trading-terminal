@@ -6,7 +6,7 @@ import requests
 import sqlite3
 import datetime
 import lightgbm as lgb
-from sklearn.preprocessing import StandardScaler
+
 
 # =====================================================================
 # 1. DATABASE & INITIALIZATION
