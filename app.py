@@ -6,7 +6,6 @@ import requests
 import sqlite3
 import datetime
 import lightgbm as lgb
-from scipy.stats import norm
 
 # Optional GARCH import handling for cloud stability
 try:
@@ -15,10 +14,31 @@ try:
 except Exception:
     GARCH_AVAILABLE = False
 
+# =====================================================================
+# CONFIGURATION & TELEGRAM KEYS
+# =====================================================================
+TELEGRAM_BOT_TOKEN = ""  # Paste your Bot Token here (or leave empty to disable)
+TELEGRAM_CHAT_ID = ""    # Paste your Chat ID here
+
+def send_telegram_alert(message):
+    """Sends lightweight push notifications to Telegram via HTTP REST API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        requests.post(url, json=payload, timeout=3)
+    except Exception:
+        pass
+
 st.set_page_config(page_title="Quantitative Trading Terminal", layout="wide")
 
 # =====================================================================
-# 1. DATABASE & PERSISTENT STATE ENGINE
+# 1. DATABASE ENGINE
 # =====================================================================
 def init_db():
     conn = sqlite3.connect("trading_terminal.db")
@@ -68,7 +88,7 @@ def set_last_trade_time(ts):
     conn.close()
 
 # =====================================================================
-# 2. MARKET DATA PIPELINE (MULTI-EXCHANGE FAILOVER)
+# 2. MARKET DATA PIPELINE
 # =====================================================================
 def fetch_market_data(symbol="BTCUSDT", limit=100):
     try:
@@ -102,13 +122,12 @@ def fetch_market_data(symbol="BTCUSDT", limit=100):
     return pd.DataFrame()
 
 # =====================================================================
-# 3. STATISTICAL & QUANTITATIVE FEATURE ENGINE
+# 3. QUANTITATIVE & RISK FEATURE ENGINE
 # =====================================================================
 def compute_indicators(df):
     if df.empty or len(df) < 30:
         return df
 
-    # Standard ATR & ADX computation
     df['tr0'] = abs(df['high'] - df['low'])
     df['tr1'] = abs(df['high'] - df['close'].shift(1))
     df['tr2'] = abs(df['low'] - df['close'].shift(1))
@@ -128,12 +147,10 @@ def compute_indicators(df):
     df['dx'] = 100 * abs(df['pos_di'] - df['neg_di']) / (df['pos_di'] + df['neg_di'] + 1e-8)
     df['adx'] = df['dx'].rolling(14).mean()
 
-    # Microstructure Order Flow Aggregates
     df['cvd'] = (df['taker_buy_base'] - (df['volume'] - df['taker_buy_base'])).cumsum()
     df['ofi'] = (df['close'] - df['open']) / (df['high'] - df['low'] + 1e-8) * df['volume']
     
-    # GARCH(1,1) Volatility Modeling
-    df['garch_vol'] = df['atr']  # Default baseline
+    df['garch_vol'] = df['atr']
     if GARCH_AVAILABLE:
         try:
             returns = 100 * df['close'].pct_change().dropna()
@@ -148,36 +165,24 @@ def compute_indicators(df):
 
     return df
 
-# =====================================================================
-# 4. MONTE CARLO TAIL-RISK ENGINE (VaR & CVaR)
-# =====================================================================
 def run_monte_carlo_risk(current_price, volatility, simulations=500, time_horizon=5):
-    """
-    Simulates price paths using Geometric Brownian Motion (GBM)
-    Returns Value at Risk (VaR 95%) and Conditional VaR (CVaR 95%)
-    """
-    dt = 1 / 1440  # 1-minute time increment
-    mu = 0  # Drift set to neutral for risk estimation
-
-    # Generate daily returns matrix
+    dt = 1 / 1440
+    mu = 0
     simulated_returns = np.random.normal(
         (mu - 0.5 * (volatility ** 2)) * dt,
         volatility * np.sqrt(dt),
         (simulations, time_horizon)
     )
-
     price_paths = current_price * np.exp(np.cumsum(simulated_returns, axis=1))
     final_prices = price_paths[:, -1]
     pnl_distribution = final_prices - current_price
-
-    var_95 = np.percentile(pnl_distribution, 5)  # 5th percentile worst loss
+    var_95 = np.percentile(pnl_distribution, 5)
     tail_losses = pnl_distribution[pnl_distribution <= var_95]
     cvar_95 = tail_losses.mean() if len(tail_losses) > 0 else var_95
-
     return abs(round(var_95, 2)), abs(round(cvar_95, 2))
 
 # =====================================================================
-# 5. ML SIGNAL & GUARDRAIL GATEWAY
+# 4. SIGNAL GENERATION & GUARDRAILS
 # =====================================================================
 def generate_quant_signal(df):
     if df.empty or len(df) < 30:
@@ -224,7 +229,7 @@ def generate_quant_signal(df):
     return "NEUTRAL", prob_long, "Signal in Low Confidence Noise Band (0.33-0.67)"
 
 # =====================================================================
-# 6. EXECUTION & LOGGING ENGINE
+# 5. EXECUTION & TELEGRAM NOTIFICATION ENGINE
 # =====================================================================
 def execute_trade(signal, price, atr, confidence, garch_vol, var_95, cvar_95):
     position_size = 0.1
@@ -267,8 +272,20 @@ def execute_trade(signal, price, atr, confidence, garch_vol, var_95, cvar_95):
     conn.commit()
     conn.close()
 
+    # Post Telegram Alert
+    alert_msg = (
+        f"🚨 *QUANT TERMINAL TRADE EXECUTION*\n\n"
+        f"• *Side:* {signal}\n"
+        f"• *Entry Price:* ${entry_price:,.2f}\n"
+        f"• *Est Net PnL:* ${net_pnl:,.2f}\n"
+        f"• *ML Conviction:* {confidence:.1%}\n"
+        f"• *Monte Carlo VaR (95%):* ${var_95:.2f}\n"
+        f"• *GARCH Volatility:* {garch_vol:.4f}"
+    )
+    send_telegram_alert(alert_msg)
+
 # =====================================================================
-# 7. AUTOMATED RUNTIME PIPELINE (TRIGGERS ON HTTP PING)
+# 6. HTTP PING RUNTIME ENGINE
 # =====================================================================
 df_data = fetch_market_data()
 df_data = compute_indicators(df_data)
@@ -279,80 +296,43 @@ if not df_data.empty:
     latest_adx = df_data['adx'].iloc[-1] if not pd.isna(df_data['adx'].iloc[-1]) else 0.0
     latest_garch = df_data['garch_vol'].iloc[-1] if not pd.isna(df_data['garch_vol'].iloc[-1]) else latest_atr
 
-    # Monte Carlo simulation for risk tracking
     var_95, cvar_95 = run_monte_carlo_risk(latest_price, volatility=latest_garch / 100.0)
-
     signal, confidence, reason = generate_quant_signal(df_data)
 
     if signal in ["LONG", "SHORT"]:
         execute_trade(signal, latest_price, latest_atr, confidence, latest_garch, var_95, cvar_95)
 
 # =====================================================================
-# 8. STREAMLIT DASHBOARD INTERFACE
+# 7. STREAMLIT AUTO-REFRESHING DASHBOARD UI
 # =====================================================================
 st.title("⚡ Autonomous Quantitative Trading Terminal")
 
-if not df_data.empty:
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("BTC Price", f"${latest_price:,.2f}")
-    col2.metric("ATR Volatility", f"${latest_atr:.2f}")
-    col3.metric("GARCH(1,1) Vol", f"{latest_garch:.4f}")
-    col4.metric("Monte Carlo VaR (95%)", f"${var_95:.2f}")
-    col5.metric("ML Conviction", f"{confidence:.1%}", delta=signal)
+@st.fragment(run_every="5s")
+def render_live_dashboard():
+    """Reruns quietly every 5 seconds to update UI metrics and trade logs."""
+    conn = sqlite3.connect("trading_terminal.db")
+    trade_df = pd.read_sql_query("SELECT * FROM trade_log ORDER BY id DESC LIMIT 20", conn)
+    conn.close()
 
-    st.subheader("System Execution Guardrails")
-    if signal in ["LONG", "SHORT"]:
-        st.success(f"**Action Executed:** Triggered {signal} position | Reason: {reason}")
+    if not df_data.empty:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("BTC Price", f"${latest_price:,.2f}")
+        col2.metric("ATR Volatility", f"${latest_atr:.2f}")
+        col3.metric("GARCH(1,1) Vol", f"{latest_garch:.4f}")
+        col4.metric("Monte Carlo VaR (95%)", f"${var_95:.2f}")
+        col5.metric("ML Conviction", f"{confidence:.1%}", delta=signal)
+
+        st.subheader("System Execution Guardrails")
+        if signal in ["LONG", "SHORT"]:
+            st.success(f"**Action Executed:** Triggered {signal} position | Reason: {reason}")
+        else:
+            st.info(f"**System Idle:** {reason}")
+
+    st.markdown("---")
+    st.subheader("Institutional Trade Execution Logs & Tail Risk Metrics")
+    if not trade_df.empty:
+        st.dataframe(trade_df, use_container_width=True)
     else:
-        st.info(f"**System Idle:** {reason}")
+        st.write("No executions logged yet. The engine is monitoring real-time market data in the background.")
 
-st.markdown("---")
-st.subheader("Institutional Trade Execution Logs & Tail Risk Metrics")
-conn = sqlite3.connect("trading_terminal.db")
-trade_df = pd.read_sql_query("SELECT * FROM trade_log ORDER BY id DESC LIMIT 20", conn)
-conn.close()
-
-if not trade_df.empty:
-    st.dataframe(trade_df, use_container_width=True)
-else:
-    st.write("No executions logged yet. The engine is monitoring real-time market data in the background.")
-   
-# =====================================================================
-# 9. PERFORMANCE & EXECUTION ANALYTICS DASHBOARD
-# =====================================================================
-st.markdown("---")
-st.header("📈 Strategy Performance & Execution Analytics")
-
-conn = sqlite3.connect("trading_terminal.db")
-all_trades = pd.read_sql_query("SELECT * FROM trade_log WHERE status='CLOSED'", conn)
-conn.close()
-
-if not all_trades.empty:
-    total_trades = len(all_trades)
-    winning_trades = all_trades[all_trades['net_pnl'] > 0]
-    losing_trades = all_trades[all_trades['net_pnl'] <= 0]
-    
-    win_rate = (len(winning_trades) / total_trades) * 100
-    gross_profit = winning_trades['net_pnl'].sum()
-    gross_loss = abs(losing_trades['net_pnl'].sum())
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else gross_profit
-    total_net_pnl = all_trades['net_pnl'].sum()
-    avg_trade_pnl = all_trades['net_pnl'].mean()
-    avg_confidence = all_trades['ml_confidence'].mean()
-
-    # Metric Cards
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total Trades", f"{total_trades}")
-    m2.metric("Win Rate", f"{win_rate:.1f}%")
-    m3.metric("Profit Factor", f"{profit_factor:.2f}")
-    m4.metric("Net Realized PnL", f"${total_net_pnl:,.2f}")
-    m5.metric("Avg Signal Conviction", f"{avg_confidence:.1%}")
-
-    # Detailed Trade Log Breakdown
-    st.subheader("Recent Execution Log")
-    st.dataframe(
-        all_trades[['id', 'timestamp', 'side', 'entry_price', 'exit_price', 'net_pnl', 'ml_confidence', 'garch_vol', 'var_95', 'cvar_95']],
-        use_container_width=True
-    )
-else:
-    st.info("📊 Gathering performance metrics... As soon as trades execute, live win rate and profit factors will calculate here.")
+render_live_dashboard()
