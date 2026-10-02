@@ -7,33 +7,12 @@ import sqlite3
 import datetime
 import lightgbm as lgb
 
-# Optional GARCH import handling for cloud stability
+# Optional GARCH import handling for deployment stability
 try:
     from arch import arch_model
     GARCH_AVAILABLE = True
 except Exception:
     GARCH_AVAILABLE = False
-
-# =====================================================================
-# CONFIGURATION & TELEGRAM KEYS
-# =====================================================================
-TELEGRAM_BOT_TOKEN = ""  # Paste your Bot Token here (or leave empty to disable)
-TELEGRAM_CHAT_ID = ""    # Paste your Chat ID here
-
-def send_telegram_alert(message):
-    """Sends lightweight push notifications to Telegram via HTTP REST API."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-        requests.post(url, json=payload, timeout=3)
-    except Exception:
-        pass
 
 st.set_page_config(page_title="Quantitative Trading Terminal", layout="wide")
 
@@ -229,7 +208,7 @@ def generate_quant_signal(df):
     return "NEUTRAL", prob_long, "Signal in Low Confidence Noise Band (0.33-0.67)"
 
 # =====================================================================
-# 5. EXECUTION & TELEGRAM NOTIFICATION ENGINE
+# 5. EXECUTION & LOGGING ENGINE (RUNS ON EVERY HTTP PING)
 # =====================================================================
 def execute_trade(signal, price, atr, confidence, garch_vol, var_95, cvar_95):
     position_size = 0.1
@@ -272,21 +251,7 @@ def execute_trade(signal, price, atr, confidence, garch_vol, var_95, cvar_95):
     conn.commit()
     conn.close()
 
-    # Post Telegram Alert
-    alert_msg = (
-        f"🚨 *QUANT TERMINAL TRADE EXECUTION*\n\n"
-        f"• *Side:* {signal}\n"
-        f"• *Entry Price:* ${entry_price:,.2f}\n"
-        f"• *Est Net PnL:* ${net_pnl:,.2f}\n"
-        f"• *ML Conviction:* {confidence:.1%}\n"
-        f"• *Monte Carlo VaR (95%):* ${var_95:.2f}\n"
-        f"• *GARCH Volatility:* {garch_vol:.4f}"
-    )
-    send_telegram_alert(alert_msg)
-
-# =====================================================================
-# 6. HTTP PING RUNTIME ENGINE
-# =====================================================================
+# --- BACKEND EXECUTION ON EVERY CRON-JOB PING ---
 df_data = fetch_market_data()
 df_data = compute_indicators(df_data)
 
@@ -303,36 +268,32 @@ if not df_data.empty:
         execute_trade(signal, latest_price, latest_atr, confidence, latest_garch, var_95, cvar_95)
 
 # =====================================================================
-# 7. STREAMLIT AUTO-REFRESHING DASHBOARD UI
+# 6. STATIC DASHBOARD DISPLAY (NO AUTO-REFRESH LOOPS)
 # =====================================================================
 st.title("⚡ Autonomous Quantitative Trading Terminal")
 
-@st.fragment(run_every="5s")
-def render_live_dashboard():
-    """Reruns quietly every 5 seconds to update UI metrics and trade logs."""
-    conn = sqlite3.connect("trading_terminal.db")
-    trade_df = pd.read_sql_query("SELECT * FROM trade_log ORDER BY id DESC LIMIT 20", conn)
-    conn.close()
+if not df_data.empty:
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("BTC Price", f"${latest_price:,.2f}")
+    col2.metric("ATR Volatility", f"${latest_atr:.2f}")
+    col3.metric("GARCH(1,1) Vol", f"{latest_garch:.4f}")
+    col4.metric("Monte Carlo VaR (95%)", f"${var_95:.2f}")
+    col5.metric("ML Conviction", f"{confidence:.1%}", delta=signal)
 
-    if not df_data.empty:
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("BTC Price", f"${latest_price:,.2f}")
-        col2.metric("ATR Volatility", f"${latest_atr:.2f}")
-        col3.metric("GARCH(1,1) Vol", f"{latest_garch:.4f}")
-        col4.metric("Monte Carlo VaR (95%)", f"${var_95:.2f}")
-        col5.metric("ML Conviction", f"{confidence:.1%}", delta=signal)
-
-        st.subheader("System Execution Guardrails")
-        if signal in ["LONG", "SHORT"]:
-            st.success(f"**Action Executed:** Triggered {signal} position | Reason: {reason}")
-        else:
-            st.info(f"**System Idle:** {reason}")
-
-    st.markdown("---")
-    st.subheader("Institutional Trade Execution Logs & Tail Risk Metrics")
-    if not trade_df.empty:
-        st.dataframe(trade_df, use_container_width=True)
+    st.subheader("System Execution Guardrails")
+    if signal in ["LONG", "SHORT"]:
+        st.success(f"**Action Executed:** Triggered {signal} position | Reason: {reason}")
     else:
-        st.write("No executions logged yet. The engine is monitoring real-time market data in the background.")
+        st.info(f"**System Idle:** {reason}")
 
-render_live_dashboard()
+st.markdown("---")
+st.subheader("Institutional Trade Execution Logs & Tail Risk Metrics")
+
+conn = sqlite3.connect("trading_terminal.db")
+trade_df = pd.read_sql_query("SELECT * FROM trade_log ORDER BY id DESC LIMIT 20", conn)
+conn.close()
+
+if not trade_df.empty:
+    st.dataframe(trade_df, use_container_width=True)
+else:
+    st.write("No executions logged yet. The engine is monitoring market data in background cycles.")
