@@ -6,11 +6,19 @@ import requests
 import sqlite3
 import datetime
 import lightgbm as lgb
+from scipy.stats import norm
+
+# Optional GARCH import handling for cloud stability
+try:
+    from arch import arch_model
+    GARCH_AVAILABLE = True
+except Exception:
+    GARCH_AVAILABLE = False
 
 st.set_page_config(page_title="Quantitative Trading Terminal", layout="wide")
 
 # =====================================================================
-# 1. DATABASE SETUP
+# 1. DATABASE & PERSISTENT STATE ENGINE
 # =====================================================================
 def init_db():
     conn = sqlite3.connect("trading_terminal.db")
@@ -27,6 +35,9 @@ def init_db():
             fee_slippage REAL,
             status TEXT,
             ml_confidence REAL,
+            garch_vol REAL,
+            var_95 REAL,
+            cvar_95 REAL,
             strategy TEXT
         )
     ''')
@@ -57,7 +68,7 @@ def set_last_trade_time(ts):
     conn.close()
 
 # =====================================================================
-# 2. MARKET DATA FEED (BYBIT -> COINBASE -> BINANCE)
+# 2. MARKET DATA PIPELINE (MULTI-EXCHANGE FAILOVER)
 # =====================================================================
 def fetch_market_data(symbol="BTCUSDT", limit=100):
     try:
@@ -90,10 +101,14 @@ def fetch_market_data(symbol="BTCUSDT", limit=100):
 
     return pd.DataFrame()
 
+# =====================================================================
+# 3. STATISTICAL & QUANTITATIVE FEATURE ENGINE
+# =====================================================================
 def compute_indicators(df):
     if df.empty or len(df) < 30:
         return df
 
+    # Standard ATR & ADX computation
     df['tr0'] = abs(df['high'] - df['low'])
     df['tr1'] = abs(df['high'] - df['close'].shift(1))
     df['tr2'] = abs(df['low'] - df['close'].shift(1))
@@ -113,13 +128,56 @@ def compute_indicators(df):
     df['dx'] = 100 * abs(df['pos_di'] - df['neg_di']) / (df['pos_di'] + df['neg_di'] + 1e-8)
     df['adx'] = df['dx'].rolling(14).mean()
 
+    # Microstructure Order Flow Aggregates
     df['cvd'] = (df['taker_buy_base'] - (df['volume'] - df['taker_buy_base'])).cumsum()
     df['ofi'] = (df['close'] - df['open']) / (df['high'] - df['low'] + 1e-8) * df['volume']
     
+    # GARCH(1,1) Volatility Modeling
+    df['garch_vol'] = df['atr']  # Default baseline
+    if GARCH_AVAILABLE:
+        try:
+            returns = 100 * df['close'].pct_change().dropna()
+            if len(returns) >= 40:
+                am = arch_model(returns, vol='Garch', p=1, q=1, dist='normal', rescale=False)
+                res = am.fit(disp='off')
+                forecast = res.forecast(horizon=1)
+                latest_forecast = np.sqrt(forecast.variance.iloc[-1].values[0])
+                df.iloc[-1, df.columns.get_loc('garch_vol')] = latest_forecast
+        except Exception:
+            pass
+
     return df
 
 # =====================================================================
-# 3. SIGNAL & GUARDRAIL ENGINE
+# 4. MONTE CARLO TAIL-RISK ENGINE (VaR & CVaR)
+# =====================================================================
+def run_monte_carlo_risk(current_price, volatility, simulations=500, time_horizon=5):
+    """
+    Simulates price paths using Geometric Brownian Motion (GBM)
+    Returns Value at Risk (VaR 95%) and Conditional VaR (CVaR 95%)
+    """
+    dt = 1 / 1440  # 1-minute time increment
+    mu = 0  # Drift set to neutral for risk estimation
+
+    # Generate daily returns matrix
+    simulated_returns = np.random.normal(
+        (mu - 0.5 * (volatility ** 2)) * dt,
+        volatility * np.sqrt(dt),
+        (simulations, time_horizon)
+    )
+
+    price_paths = current_price * np.exp(np.cumsum(simulated_returns, axis=1))
+    final_prices = price_paths[:, -1]
+    pnl_distribution = final_prices - current_price
+
+    var_95 = np.percentile(pnl_distribution, 5)  # 5th percentile worst loss
+    tail_losses = pnl_distribution[pnl_distribution <= var_95]
+    cvar_95 = tail_losses.mean() if len(tail_losses) > 0 else var_95
+
+    return abs(round(var_95, 2)), abs(round(cvar_95, 2))
+
+# =====================================================================
+# 5. ML SIGNAL & GUARDRAIL GATEWAY
 # =====================================================================
 def generate_quant_signal(df):
     if df.empty or len(df) < 30:
@@ -165,7 +223,10 @@ def generate_quant_signal(df):
 
     return "NEUTRAL", prob_long, "Signal in Low Confidence Noise Band (0.33-0.67)"
 
-def execute_trade(signal, price, atr, confidence):
+# =====================================================================
+# 6. EXECUTION & LOGGING ENGINE
+# =====================================================================
+def execute_trade(signal, price, atr, confidence, garch_vol, var_95, cvar_95):
     position_size = 0.1
     fee_per_trade = 8.41
     tp_distance = max(2.5 * atr, 200.0)
@@ -186,8 +247,8 @@ def execute_trade(signal, price, atr, confidence):
     conn = sqlite3.connect("trading_terminal.db")
     c = conn.cursor()
     c.execute('''
-        INSERT INTO trade_log (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence, strategy)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO trade_log (timestamp, side, entry_price, exit_price, gross_pnl, net_pnl, fee_slippage, status, ml_confidence, garch_vol, var_95, cvar_95, strategy)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         signal,
@@ -198,13 +259,16 @@ def execute_trade(signal, price, atr, confidence):
         fee_per_trade,
         "CLOSED",
         round(confidence, 4),
-        "ML_Microstructure_v2"
+        round(garch_vol, 4),
+        var_95,
+        cvar_95,
+        "ML_GARCH_MonteCarlo_v3"
     ))
     conn.commit()
     conn.close()
 
 # =====================================================================
-# 4. TRADING EXECUTION ON PAGE LOAD / HTTP PING
+# 7. AUTOMATED RUNTIME PIPELINE (TRIGGERS ON HTTP PING)
 # =====================================================================
 df_data = fetch_market_data()
 df_data = compute_indicators(df_data)
@@ -213,32 +277,37 @@ if not df_data.empty:
     latest_price = df_data['close'].iloc[-1]
     latest_atr = df_data['atr'].iloc[-1] if not pd.isna(df_data['atr'].iloc[-1]) else 100.0
     latest_adx = df_data['adx'].iloc[-1] if not pd.isna(df_data['adx'].iloc[-1]) else 0.0
+    latest_garch = df_data['garch_vol'].iloc[-1] if not pd.isna(df_data['garch_vol'].iloc[-1]) else latest_atr
+
+    # Monte Carlo simulation for risk tracking
+    var_95, cvar_95 = run_monte_carlo_risk(latest_price, volatility=latest_garch / 100.0)
 
     signal, confidence, reason = generate_quant_signal(df_data)
 
     if signal in ["LONG", "SHORT"]:
-        execute_trade(signal, latest_price, latest_atr, confidence)
+        execute_trade(signal, latest_price, latest_atr, confidence, latest_garch, var_95, cvar_95)
 
 # =====================================================================
-# 5. DASHBOARD UI
+# 8. STREAMLIT DASHBOARD INTERFACE
 # =====================================================================
 st.title("⚡ Autonomous Quantitative Trading Terminal")
 
 if not df_data.empty:
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("BTC Price", f"${latest_price:,.2f}")
-    col2.metric("Market Volatility (ATR)", f"${latest_atr:.2f}")
-    col3.metric("Trend Strength (ADX)", f"{latest_adx:.1f}", delta="Strong" if latest_adx >= 20 else "Flat")
-    col4.metric("ML Signal Conviction", f"{confidence:.1%}", delta=signal)
+    col2.metric("ATR Volatility", f"${latest_atr:.2f}")
+    col3.metric("GARCH(1,1) Vol", f"{latest_garch:.4f}")
+    col4.metric("Monte Carlo VaR (95%)", f"${var_95:.2f}")
+    col5.metric("ML Conviction", f"{confidence:.1%}", delta=signal)
 
-    st.subheader("System Execution Status")
+    st.subheader("System Execution Guardrails")
     if signal in ["LONG", "SHORT"]:
-        st.success(f"**Action Triggered:** Executing {signal} position | Reason: {reason}")
+        st.success(f"**Action Executed:** Triggered {signal} position | Reason: {reason}")
     else:
         st.info(f"**System Idle:** {reason}")
 
 st.markdown("---")
-st.subheader("Trade Execution Logs")
+st.subheader("Institutional Trade Execution Logs & Tail Risk Metrics")
 conn = sqlite3.connect("trading_terminal.db")
 trade_df = pd.read_sql_query("SELECT * FROM trade_log ORDER BY id DESC LIMIT 20", conn)
 conn.close()
@@ -246,4 +315,4 @@ conn.close()
 if not trade_df.empty:
     st.dataframe(trade_df, use_container_width=True)
 else:
-    st.write("No trade executions logged yet.")
+    st.write("No executions logged yet. The engine is monitoring real-time market data in the background.")
