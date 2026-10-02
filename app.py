@@ -316,3 +316,43 @@ if not trade_df.empty:
     st.dataframe(trade_df, use_container_width=True)
 else:
     st.write("No executions logged yet. The engine is monitoring real-time market data in the background.")
+   
+# =====================================================================
+# 9. PERFORMANCE & EXECUTION ANALYTICS DASHBOARD
+# =====================================================================
+st.markdown("---")
+st.header("📈 Strategy Performance & Execution Analytics")
+
+conn = sqlite3.connect("trading_terminal.db")
+all_trades = pd.read_sql_query("SELECT * FROM trade_log WHERE status='CLOSED'", conn)
+conn.close()
+
+if not all_trades.empty:
+    total_trades = len(all_trades)
+    winning_trades = all_trades[all_trades['net_pnl'] > 0]
+    losing_trades = all_trades[all_trades['net_pnl'] <= 0]
+    
+    win_rate = (len(winning_trades) / total_trades) * 100
+    gross_profit = winning_trades['net_pnl'].sum()
+    gross_loss = abs(losing_trades['net_pnl'].sum())
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else gross_profit
+    total_net_pnl = all_trades['net_pnl'].sum()
+    avg_trade_pnl = all_trades['net_pnl'].mean()
+    avg_confidence = all_trades['ml_confidence'].mean()
+
+    # Metric Cards
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Trades", f"{total_trades}")
+    m2.metric("Win Rate", f"{win_rate:.1f}%")
+    m3.metric("Profit Factor", f"{profit_factor:.2f}")
+    m4.metric("Net Realized PnL", f"${total_net_pnl:,.2f}")
+    m5.metric("Avg Signal Conviction", f"{avg_confidence:.1%}")
+
+    # Detailed Trade Log Breakdown
+    st.subheader("Recent Execution Log")
+    st.dataframe(
+        all_trades[['id', 'timestamp', 'side', 'entry_price', 'exit_price', 'net_pnl', 'ml_confidence', 'garch_vol', 'var_95', 'cvar_95']],
+        use_container_width=True
+    )
+else:
+    st.info("📊 Gathering performance metrics... As soon as trades execute, live win rate and profit factors will calculate here.")
