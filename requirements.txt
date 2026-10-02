@@ -1,7 +1,6 @@
 streamlit
 pandas
 numpy
-plotly
-lightgbm
 requests
-psycopg2-binary
+lightgbm
+scikit-learn
