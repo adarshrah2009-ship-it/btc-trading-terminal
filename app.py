@@ -39,15 +39,48 @@ if "last_trade_time" not in st.session_state:
     st.session_state.last_trade_time = 0
 
 # =====================================================================
-# 2. MARKET DATA & INDICATOR COMPUTATION (MULTIPLE ENDPOINTS FALLBACK)
+# 2. MULTI-EXCHANGE MARKET DATA ENGINE (BYBIT -> COINBASE -> BINANCE)
 # =====================================================================
 @st.cache_data(ttl=5)
-def fetch_binance_data(symbol="BTCUSDT", limit=100):
+def fetch_market_data(symbol="BTCUSDT", limit=100):
+    # Strategy 1: Bybit Public API (No Cloud IP Geoblock)
+    try:
+        url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval=1&limit={limit}"
+        res = requests.get(url, timeout=4).json()
+        if res.get("retCode") == 0 and res.get("result", {}).get("list"):
+            raw_data = res["result"]["list"]
+            # Bybit returns desc order: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+            df = pd.DataFrame(raw_data, columns=['open_time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+            df = df.iloc[::-1].reset_index(drop=True)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            # Estimate taker buy volume for CVD simulation
+            df['taker_buy_base'] = df['volume'] * 0.52
+            return df
+    except Exception:
+        pass
+
+    # Strategy 2: Coinbase API Fallback
+    try:
+        cb_symbol = "BTC-USD" if symbol == "BTCUSDT" else symbol
+        url = f"https://api.exchange.coinbase.com/products/{cb_symbol}/candles?granularity=60"
+        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4).json()
+        if isinstance(res, list) and len(res) > 0:
+            # Coinbase format: [time, low, high, open, close, volume]
+            df = pd.DataFrame(res[:limit], columns=['open_time', 'low', 'high', 'open', 'close', 'volume'])
+            df = df.iloc[::-1].reset_index(drop=True)
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            df['taker_buy_base'] = df['volume'] * 0.50
+            return df
+    except Exception:
+        pass
+
+    # Strategy 3: Binance API Fallback
     urls = [
         f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}",
         f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}",
-        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}",
-        f"https://api3.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
     ]
     for url in urls:
         try:
@@ -57,17 +90,13 @@ def fetch_binance_data(symbol="BTCUSDT", limit=100):
                     'open_time', 'open', 'high', 'low', 'close', 'volume',
                     'close_time', 'quote_vol', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
                 ])
-                df['close'] = df['close'].astype(float)
-                df['high'] = df['high'].astype(float)
-                df['low'] = df['low'].astype(float)
-                df['open'] = df['open'].astype(float)
-                df['volume'] = df['volume'].astype(float)
-                df['taker_buy_base'] = df['taker_buy_base'].astype(float)
+                for col in ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base']:
+                    df[col] = df[col].astype(float)
                 return df
         except Exception:
             continue
-            
-    st.error("⚠️ Unable to reach market data endpoints. Cloud IP might be rate-limited by Binance. Retrying...")
+
+    st.error("⚠️ All live market data feeds are temporarily unreachable. Retrying...")
     return pd.DataFrame()
 
 def compute_indicators(df):
@@ -201,7 +230,7 @@ def execute_trade(signal, price, atr, confidence):
 # =====================================================================
 st.title("⚡ Autonomous Quantitative Trading Terminal")
 
-df_data = fetch_binance_data()
+df_data = fetch_market_data()
 df_data = compute_indicators(df_data)
 
 if not df_data.empty:
