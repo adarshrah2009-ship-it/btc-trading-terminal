@@ -4,3 +4,5 @@ numpy
 requests
 lightgbm
 scikit-learn
+scipy
+arch
