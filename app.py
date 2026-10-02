@@ -7,7 +7,6 @@ import sqlite3
 import datetime
 import lightgbm as lgb
 
-
 # =====================================================================
 # 1. DATABASE & INITIALIZATION
 # =====================================================================
@@ -40,27 +39,36 @@ if "last_trade_time" not in st.session_state:
     st.session_state.last_trade_time = 0
 
 # =====================================================================
-# 2. MARKET DATA & INDICATOR COMPUTATION
+# 2. MARKET DATA & INDICATOR COMPUTATION (MULTIPLE ENDPOINTS FALLBACK)
 # =====================================================================
 @st.cache_data(ttl=5)
 def fetch_binance_data(symbol="BTCUSDT", limit=100):
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
-        res = requests.get(url, timeout=5).json()
-        df = pd.DataFrame(res, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_vol', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
-        ])
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['open'] = df['open'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        df['taker_buy_base'] = df['taker_buy_base'].astype(float)
-        return df
-    except Exception as e:
-        st.error(f"Error fetching exchange data: {e}")
-        return pd.DataFrame()
+    urls = [
+        f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}",
+        f"https://api1.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}",
+        f"https://api2.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}",
+        f"https://api3.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit={limit}"
+    ]
+    for url in urls:
+        try:
+            res = requests.get(url, timeout=3).json()
+            if isinstance(res, list) and len(res) > 0:
+                df = pd.DataFrame(res, columns=[
+                    'open_time', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_vol', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'
+                ])
+                df['close'] = df['close'].astype(float)
+                df['high'] = df['high'].astype(float)
+                df['low'] = df['low'].astype(float)
+                df['open'] = df['open'].astype(float)
+                df['volume'] = df['volume'].astype(float)
+                df['taker_buy_base'] = df['taker_buy_base'].astype(float)
+                return df
+        except Exception:
+            continue
+            
+    st.error("⚠️ Unable to reach market data endpoints. Cloud IP might be rate-limited by Binance. Retrying...")
+    return pd.DataFrame()
 
 def compute_indicators(df):
     if df.empty or len(df) < 30:
@@ -104,15 +112,11 @@ def generate_quant_signal(df):
 
     latest = df.iloc[-1]
     
-    # -------------------------------------------------------------
     # GUARDRAIL 1: Hard ADX Trend Filter Gate
-    # -------------------------------------------------------------
     if pd.isna(latest['adx']) or latest['adx'] < 20.0:
         return "NEUTRAL", 0.50, f"Blocked: Market Choppy (ADX {latest['adx']:.1f} < 20)"
 
-    # -------------------------------------------------------------
     # GUARDRAIL 2: Trade Cooldown (15 Minutes)
-    # -------------------------------------------------------------
     current_time = time.time()
     if current_time - st.session_state.last_trade_time < 900:  # 900 seconds = 15 mins
         remaining = int((900 - (current_time - st.session_state.last_trade_time)) / 60)
@@ -125,28 +129,21 @@ def generate_quant_signal(df):
     if len(X) < 20:
         return "NEUTRAL", 0.50, "Warming up indicators"
 
-    # Simplified Model Target: Directional move over 5 periods
     y = np.where(df['close'].shift(-5) > df['close'], 1, 0)[:len(X)]
     
     model = lgb.LGBMClassifier(n_estimators=30, max_depth=3, learning_rate=0.05, verbose=-1)
     model.fit(X.iloc[:-1], y[:-1])
     
-    # Predict latest probability
     prob_long = float(model.predict_proba(X.iloc[[-1]])[0][1])
 
-    # -------------------------------------------------------------
     # GUARDRAIL 3: High-Confidence Thresholds & Sweep Shields
-    # -------------------------------------------------------------
-    # LONG Entry Signal
     if prob_long >= 0.68:
-        # Check CVD confirmation (no divergence)
         if latest['cvd'] > df['cvd'].iloc[-5]:
             st.session_state.last_trade_time = current_time
             return "LONG", prob_long, "High Conviction Long + Volume Support"
         else:
             return "NEUTRAL", prob_long, "Blocked: CVD Liquidity Divergence"
 
-    # SHORT Entry Signal
     elif prob_long <= 0.32:
         if latest['cvd'] < df['cvd'].iloc[-5]:
             st.session_state.last_trade_time = current_time
@@ -165,7 +162,6 @@ def execute_trade(signal, price, atr, confidence):
     
     # Dynamic ATR Take Profit Target (Minimum $200 BTC move)
     tp_distance = max(2.5 * atr, 200.0)
-    sl_distance = 1.0 * atr
 
     if signal == "LONG":
         entry_price = price
@@ -228,7 +224,6 @@ if not df_data.empty:
     else:
         st.info(f"**System Idle:** {reason}")
 
-    # Display Trade History Table
     st.markdown("---")
     st.subheader("Trade Execution Logs")
     conn = sqlite3.connect("trading_terminal.db")
